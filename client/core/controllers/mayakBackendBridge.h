@@ -1,0 +1,124 @@
+#pragma once
+#include <QObject>
+#include <QPointer>
+#include <QJsonObject>
+#include <atomic>
+#include <functional>
+#include <memory>
+#include "core/utils/awgTunnelHealth.h"
+#include "core/utils/mayakTunnelProbe.h"
+
+// Deadlines use monotonicMillis(). Methods belong to the facade QObject thread;
+// the shared gate may be invalidated synchronously from any thread.
+class MayakBackendBridge final : public QObject {
+    Q_OBJECT
+public:
+    using Millis = qint64;
+    struct StartGate {
+        enum State { Pending, Cancelled, ActivationCommitted };
+        std::atomic<State> state { Pending };
+        std::atomic<bool> cancellationRequested { false };
+        bool commit() { State s = Pending; return !cancellationRequested.load() && state.compare_exchange_strong(s, ActivationCommitted); }
+        void cancel() { cancellationRequested.store(true); State s = Pending; state.compare_exchange_strong(s, Cancelled); }
+    };
+    struct Ticket {
+        QString opaqueAttempt;
+        std::shared_ptr<StartGate> gate;
+        bool valid() const { return !opaqueAttempt.isEmpty() && bool(gate); }
+        bool same(const Ticket& t) const { return opaqueAttempt == t.opaqueAttempt && gate == t.gate; }
+    };
+    enum class Outcome { Started, Cancelled, ConfirmedDown, Failed, Unknown, Deadline, Busy };
+    enum class OwnState { Active, Off, Unknown };
+    enum class PermissionResult { Ready, Denied, Unavailable };
+    struct Result {
+        Ticket ticket;
+        Outcome outcome = Outcome::Unknown;
+        AwgHealthContext expected;
+        QString requestId;
+        QString detail;
+    };
+    struct Inspection {
+        OwnState state = OwnState::Unknown;
+        QString requestId;
+        QString ownControlIdentity; // Recovery identity only, never trusted proof.
+        Ticket recoveryTicket; // Only usable for stopAndConfirm, never start/proof.
+    };
+    using Done = std::function<void(Result)>;
+    using Inspected = std::function<void(Inspection)>;
+    using Probed = std::function<void(Ticket, bool, MayakTunnelProbeProof, QString)>;
+    using PermissionDone = std::function<void(QString, PermissionResult)>;
+    // Functions run ONLY on owner. Production owner retains committed activation
+    // and transport after facade timeout/destruction until genuine Down, or keeps
+    // unresolved authority until process exit. Native start must commit the gate
+    // immediately before activation. Cancellation never claims backend Off.
+    struct Port {
+        QPointer<QObject> owner;
+        std::function<void(Ticket, QString, QJsonObject, Millis, Done)> start;
+        std::function<void(Ticket)> cancel;
+        std::function<void(Ticket, QString, Millis, Done)> stop;
+        std::function<void(QString, Millis, Inspected)> inspect;
+        std::function<void(Ticket, MayakTunnelProbeRequest, Millis, Probed)> probe;
+        std::function<void(QObject*, std::function<void(Ticket, AwgTunnelHealth)>, Done)> observe;
+        std::function<void(QString, PermissionDone)> preparePermissions;
+        std::function<void(QString)> cancelPermissionPreparation;
+        // Optional (Android): replace the running backend's transport under the same
+        // ticket and proof context. Outcome Started = a new backend is running.
+        std::function<void(Ticket, QString, Millis, Done)> recover;
+        // Optional (Android): underlying network events for the current ticket.
+        std::function<void(QObject*, std::function<void(Ticket, bool)>)> observeNetwork;
+        // Optional (Android): UI became visible again. backendReplaced = the service watchdog
+        // replaced the backend (new generation, same proof context) while the UI was hidden.
+        std::function<void(QObject*, std::function<void(Ticket, bool, bool)>)> observeResume;
+        // Optional (Android): cold-start adoption of the running managed backend found by
+        // inspection. (recovery, fresh, controlIdentity, prepared config, nonce, deadline).
+        // Started = the service confirmed identity+ticket and soft-replaced the backend; the
+        // owner now holds `fresh`. Anything else leaves `recovery` as the only (stop) authority.
+        std::function<void(Ticket, Ticket, QString, QJsonObject, QString, Millis, Done)> adopt;
+        // Optional (Android): the current managed backend was stopped by the user outside the
+        // owner (notification/tile "Disconnect", VPN revoked).
+        std::function<void(QObject*, std::function<void(Ticket)>)> observeUserStop;
+        // Optional (Android): app UI visibility (Activity started/stopped). While hidden the
+        // service streams no health and its watchdog owns stuck-tunnel repair.
+        std::function<void(QObject*, std::function<void(bool)>)> observeVisibility;
+        // Optional (Android): the service watchdog could not repair the current backend's exit.
+        std::function<void(QObject*, std::function<void(Ticket)>)> observeFailover;
+        // Optional: the Xray path race engine. One xray process with one local SOCKS5 entry per
+        // path and NO tunnel and NO route change. raceStart(requestId, xray JSON, deadline,
+        // done(started)); raceStop(requestId, deadline, done(stopped)). A race never starts while
+        // a managed backend runs, and a managed start waits until the race engine is stopped.
+        std::function<void(QString, QJsonObject, Millis, std::function<void(bool)>)> raceStart;
+        std::function<void(QString, Millis, std::function<void(bool)>)> raceStop;
+    };
+    explicit MayakBackendBridge(Port port, QObject* parent = nullptr);
+    ~MayakBackendBridge() override;
+    static Millis monotonicMillis();
+    static QString randomRequestId(); // 32 system-random bytes encoded as hex.
+    void startPrepared(Ticket ticket, QString serverId, QJsonObject awgConfig, Millis deadline, Done done);
+    void cancel(Ticket ticket);
+    void stopAndConfirm(Ticket ticket, Millis deadline, Done done);
+    void inspectOwnBackend(Millis deadline, Inspected done);
+    void probe(Ticket ticket, MayakTunnelProbeRequest request, Millis deadline, Probed done);
+    bool canRecover() const;
+    void recover(Ticket ticket, Millis deadline, Done done);
+    bool canAdopt() const;
+    void adopt(Ticket recovery, Ticket fresh, QString controlIdentity, QJsonObject config, Millis deadline, Done done);
+    bool canRace() const;
+    void raceStart(QString requestId, QJsonObject xrayConfig, Millis deadline, std::function<void(bool)> done);
+    void raceStop(QString requestId, Millis deadline, std::function<void(bool)> done);
+    void preparePermissions(QString requestId, PermissionDone done);
+    void cancelPermissionPreparation(const QString &requestId);
+signals:
+    void activated(const MayakBackendBridge::Result& activation);
+    void health(const MayakBackendBridge::Ticket& ticket, const AwgTunnelHealth& health);
+    void error(const MayakBackendBridge::Result& error);
+    // Separate cleanup event may be late; operation callback never revives.
+    void backendDown(const MayakBackendBridge::Result& result);
+    void networkChanged(const MayakBackendBridge::Ticket& ticket, bool available);
+    void resumed(const MayakBackendBridge::Ticket& ticket, bool backendReplaced, bool networkAvailable);
+    void userStopped(const MayakBackendBridge::Ticket& ticket);
+    void visibilityChanged(bool visible);
+    void failoverRequested(const MayakBackendBridge::Ticket& ticket);
+private:
+    struct State;
+    std::shared_ptr<State> m_state;
+};

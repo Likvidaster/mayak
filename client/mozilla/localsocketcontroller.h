@@ -1,0 +1,86 @@
+#include <QHash>
+#include <QSet>
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LOCALSOCKETCONTROLLER_H
+#define LOCALSOCKETCONTROLLER_H
+
+#include <QHostAddress>
+#include <QLocalSocket>
+#include <QTimer>
+#include <functional>
+
+#include "controllerimpl.h"
+
+
+class QJsonObject;
+
+class LocalSocketController final : public ControllerImpl {
+  Q_DISABLE_COPY_MOVE(LocalSocketController)
+
+ public:
+  LocalSocketController();
+  ~LocalSocketController();
+
+  void initialize(const Device* device, const Keys* keys) override;
+
+  void activate(const QJsonObject& rawConfig) override;
+
+  void deactivate() override;
+
+  void checkStatus() override;
+  void managedDeactivate(const QString& request, const QString& context) override;
+  void inspectOwnBackend(const QString& request) override;
+  AwgHealthContext expectedAwgHealthContext() const override { return m_healthActive ? m_expectedHealth : AwgHealthContext{}; }
+
+  void getBackendLogs(std::function<void(const QString&)>&& callback) override;
+
+  void cleanupBackendLogs() override;
+
+  bool multihopSupported() override { return true; }
+
+ private:
+  void initializeInternal();
+  void flushManagedRequests();
+  void disconnectInternal();
+
+  void daemonConnected();
+  void errorOccurred(QLocalSocket::LocalSocketError socketError);
+  void readData();
+  void parseCommand(const QByteArray& command);
+
+  void write(const QJsonObject& json);
+
+ private:
+  enum {
+    eUnknown,
+    eInitializing,
+    eReady,
+    eDisconnected,
+  } m_daemonState = eUnknown;
+
+  QLocalSocket* m_socket = nullptr;
+
+  QByteArray m_buffer;
+
+  QString m_deviceIpv4;
+  std::function<void(const QString&)> m_logCallback = nullptr;
+
+  QTimer m_initializingTimer;
+  uint32_t m_initializingRetry = 0;
+  quint64 m_healthGeneration = 1;
+  quint64 m_pendingStatusGeneration = 0;
+  quint64 m_statusRequestSerial = 0;
+  quint64 m_connectedGeneration = 0;
+  bool m_statusRequestPending = false;
+  bool m_healthActive = false;
+  QString m_pendingStatusId;
+  AwgHealthContext m_expectedHealth;
+  QString m_activePeerPublicKey;
+  QHash<QString, QString> m_managedStops;
+  QSet<QString> m_managedInspections;
+};
+
+#endif  // LOCALSOCKETCONTROLLER_H

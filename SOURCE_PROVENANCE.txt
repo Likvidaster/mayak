@@ -1,0 +1,28 @@
+MayakVPN 5.1.0.25 source provenance
+Base archive (published 5.1.0.23) SHA-256: 60b60a2f7f284f38210a4565f0065a63c1c07b7ba58be2da12c0de6d1afcdd9d
+Delta report SHA-256: 7915de4098b1421eca41eed2911e0597e3193e89f48c9f1f8f913ed060e33f0b
+Overlaid files (kind, path, SHA-256):
+  changed client/core/controllers/api/mayakAdmissionClient.cpp 0b83795547aca6ea950ef99756faea485551b5ac20faf0a74196a98d567ee055
+  changed client/core/controllers/api/mayakAdmissionClient.h 7539303656581b5c6382b3f1fac08ac845e8144263f09bddc3ca353f2b5bb198
+  changed client/core/controllers/coreController.cpp 712556e954aac8b0f95aa998efbdd536988e2e7e371934a64c773eaf9f72ab99
+  changed client/core/controllers/mayakAutoConnectRuntime.cpp a03af0cfd596931fcfe589b5f5cdb21f606e83a1611ec346e566f3b8226b95b6
+  changed client/core/controllers/mayakAutoConnectRuntime.h 28486a581c7555affe0953979e6159388c0a7971634faf3ffca041536fab2169
+  changed client/platforms/windows/daemon/windowstunnelservice.cpp 362d17043c1c9b623150dbc62f081a140018e2466b6002a6b8a4b0e37abf7ed9
+  changed client/platforms/windows/daemon/windowstunnelservice.h d21e663a8a15c60191e019fd1e52b0cb7a6f1121c09fcd85e335adad887ded2e
+  changed client/tests/api/testMayakRuntime.cpp 3d9f3fd88b481a75847f7df65f6754e9a71c02387f36a6d340e706550df7f32a
+  changed client/tests/windowsUapi/nativeApiFakes.h 6d4dedbaeb698a641176c3f8b0dcafef15461bf6df194586ce29e6eb42f808c9
+  changed client/tests/windowsUapi/testWindowsUapiTransaction.cpp afdb42085d9dd21468209e458304b90856f304e8d5811558be740815b41aea02
+  added client/ui/controllers/mayakCityPhotoUiController.cpp 7755b0ea63112480298ef41d68026ede0850990157bcc35015f440a1dec6353d
+  added client/ui/controllers/mayakCityPhotoUiController.h b5171a9c225c70b54aebadb2f18671f341874cdb95a6e2de26678f7258909d7c
+  changed client/ui/qml/Components/ConnectButton.qml bfe03170c5991f795bb589f4350e5a3e8327f5d3dc324c66ba1e17212b4babff
+  changed client/ui/qml/MayakCity/MayakCity.js 2ae59cd4edee6bb9959664e16072b39c25b00cdfa8be821890dce83942ced19d
+  changed client/ui/qml/Pages2/PageHome.qml 2ee8a08bb3f24c217644839a4e22b235c575e338e11f64c7d408909d665fb764
+  changed service/server/main.cpp cee99086da03294b11c09a6d935aad1c0cbd9ed3d00313c9ba5ef0cbb79f2f81
+Not included (build artefacts/binaries):
+  client/3rd/SortFilterProxyModel/.git
+  client/3rd/qtgamepad/.git
+  client/3rd/qtkeychain/.git
+  client/android/gradle/wrapper/gradle-wrapper.jar
+  client/android/xray/libXray/libxray.aar
+  mayak/tools/__pycache__/gen_ru_networks.cpython-313.pyc
+  mayak/tools/__pycache__/gen_tray_icons.cpython-313.pyc

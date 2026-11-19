@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CPackWiXPatch>
+    <CPackWiXFragment Id="CM_CP_AmneziaVPN.MayakVPN_service.exe">
+        <ServiceInstall
+                Id="MayakServiceInstall"
+                Name="MayakVPN-service"
+                DisplayName="Mayak VPN Service"
+                Description="Service for Mayak VPN"
+                Start="auto"
+                Type="ownProcess"
+                ErrorControl="normal"
+                Vital="no">
+            <ServiceDependency Id="BFE" />
+            <ServiceDependency Id="nsi" />
+        </ServiceInstall>
+        <ServiceControl
+                Id="MayakServiceControl"
+                Name="MayakVPN-service"
+                Start="install"
+                Stop="both"
+                Remove="uninstall"
+                Wait="yes" />
+    </CPackWiXFragment>
+</CPackWiXPatch>

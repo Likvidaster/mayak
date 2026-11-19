@@ -1,0 +1,818 @@
+#include <QUuid>
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "daemon.h"
+
+#include <QCoreApplication>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QMetaEnum>
+#include <QTimer>
+#include <QScopeGuard>
+
+#include "leakdetector.h"
+#include "logger.h"
+
+constexpr const char* JSON_ALLOWEDIPADDRESSRANGES = "allowedIPAddressRanges";
+constexpr int HANDSHAKE_POLL_MSEC = 250;
+
+namespace {
+
+Logger logger("Daemon");
+
+Daemon* s_daemon = nullptr;
+
+}  // namespace
+
+Daemon::Daemon(QObject* parent) : QObject(parent) {
+  MZ_COUNT_CTOR(Daemon);
+
+  logger.debug() << "Daemon created";
+
+  Q_ASSERT(s_daemon == nullptr);
+  s_daemon = this;
+
+  m_handshakeTimer.setSingleShot(true);
+  connect(&m_handshakeTimer, &QTimer::timeout, this, &Daemon::checkHandshake);
+}
+
+Daemon::~Daemon() {
+  MZ_COUNT_DTOR(Daemon);
+
+  logger.debug() << "Daemon released";
+
+  Q_ASSERT(s_daemon == this);
+  s_daemon = nullptr;
+}
+
+// static
+Daemon* Daemon::instance() {
+  Q_ASSERT(s_daemon);
+  return s_daemon;
+}
+
+bool Daemon::activateWithHealthContext(const InterfaceConfig& config, const QString& contextId) {
+#ifdef Q_OS_WINDOWS
+  const bool freshLegacyStart = contextId.isEmpty() && m_controlIdentity.isEmpty() &&
+      !m_teardownUncertain && m_connections.isEmpty() && !wgutils()->interfaceExists();
+  if (!contextId.isEmpty() || freshLegacyStart) {
+    // Reject B before invalidating A or invoking any platform hook/signal.
+    if (!m_controlIdentity.isEmpty() || m_teardownUncertain ||
+        !m_connections.isEmpty() || wgutils()->interfaceExists()) return false;
+    m_controlIdentity = contextId.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : contextId;
+    m_windowsCleanupConfig = config;
+    m_windowsManagedActivation = true;
+    m_teardownUncertain = true;
+    const bool activated = activate(config);
+    m_windowsManagedActivation = false;
+    if (!activated) {
+      cleanupWindowsManagedActivation();
+      return false;
+    }
+    m_healthContextId = contextId;
+    m_teardownUncertain = false;
+    m_healthHopType = config.m_hopType;
+    ++m_healthGeneration;
+    return true;
+  }
+#endif
+  m_healthContextId.clear();
+#ifdef Q_OS_WINDOWS
+  const quint64 priorGeneration = m_healthGeneration;
+#endif
+  if (!activate(config)) return false;
+#ifdef Q_OS_WINDOWS
+  // A legacy replacement can recurse through a fresh transactional activation.
+  if (m_healthGeneration != priorGeneration) return true;
+#endif
+  m_healthContextId = contextId;
+  m_controlIdentity = contextId.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : contextId;
+  m_teardownUncertain = false;
+  m_healthHopType = config.m_hopType;
+  ++m_healthGeneration;
+  return true;
+}
+
+bool Daemon::activate(const InterfaceConfig& config) {
+  m_healthContextId.clear();
+  Q_ASSERT(wgutils() != nullptr);
+
+  // There are 3 possible scenarios in which this method is called:
+  //
+  // 1. the VPN is off: the method tries to enable the VPN.
+  // 2. the VPN is on and the platform doesn't support the server-switching:
+  //    this method calls deactivate() and then it continues as 1.
+  // 3. the VPN is on and the platform supports the server-switching: this
+  //    method calls switchServer().
+  //
+  // At the end, if the activation succeds, the `connected` signal is emitted.
+  // If the activation abort's for any reason `the `activationFailure` signal is
+  // emitted.
+  logger.debug() << "Activating interface";
+  auto emit_failure_guard = qScopeGuard([this] {
+#ifdef Q_OS_WINDOWS
+    // Legacy observers disable the firewall; managed rollback must first
+    // confirm native stop. The IPC caller still receives activation failure.
+    if (m_windowsManagedActivation) return;
+#endif
+    emit activationFailure();
+  });
+
+  if (m_connections.contains(config.m_hopType)) {
+    if (supportServerSwitching(config)) {
+      logger.debug() << "Already connected. Server switching supported.";
+
+      if (!switchServer(config)) {
+        return false;
+      }
+
+      if (!dnsutils()->restoreResolvers()) {
+        return false;
+      }
+
+      if (!maybeUpdateResolvers(config)) {
+        return false;
+      }
+
+      bool status = run(Switch, config);
+      logger.debug() << "Connection status:" << status;
+      if (status) {
+        m_connections[config.m_hopType] = ConnectionState(config);
+#ifdef Q_OS_WINDOWS
+        if (m_windowsCleanupConfig) m_windowsCleanupConfig = config;
+#endif
+        m_handshakeTimer.start(HANDSHAKE_POLL_MSEC);
+        emit_failure_guard.dismiss();
+        return true;
+      }
+      return false;
+    }
+
+    logger.warning() << "Already connected. Server switching not supported.";
+    if (!deactivate(false)) {
+      return false;
+    }
+
+    Q_ASSERT(!m_connections.contains(config.m_hopType));
+#ifdef Q_OS_WINDOWS
+    if (activateWithHealthContext(config, QString())) {
+#else
+    if (activate(config)) {
+#endif
+      emit_failure_guard.dismiss();
+      return true;
+    }
+    return false;
+  }
+
+  prepareActivation(config);
+
+  // Recheck before mutation: another process may have created the fixed-name
+  // service since managed admission. Never adopt that interface for this try.
+  const bool interfaceExists = wgutils()->interfaceExists();
+#ifdef Q_OS_WINDOWS
+  if (m_windowsManagedActivation && interfaceExists) return false;
+#endif
+  // Bring up the wireguard interface if not already done.
+  if (!interfaceExists) {
+    // Record the attempt before calling: addInterface can fail after creation.
+#ifdef Q_OS_WINDOWS
+    if (m_windowsManagedActivation) m_windowsInterfaceAttempted = true;
+#endif
+    if (!wgutils()->addInterface(config)) {
+      logger.error() << "Interface creation failed.";
+      return false;
+    }
+  }
+
+  // Bring the interface up.
+  if (supportIPUtils()) {
+    if (!iputils()->addInterfaceIPs(config)) {
+      return false;
+    }
+    if (!iputils()->setMTUAndUp(config)) {
+      return false;
+    }
+  }
+
+  // Configure routing for excluded addresses.
+  for (const QString& i : config.m_excludedAddresses) {
+#ifdef Q_OS_WINDOWS
+    if (!addExclusionRoute(IPAddress(i))) return false;
+#else
+    addExclusionRoute(IPAddress(i));
+#endif
+  }
+
+  // Add the peer to this interface.
+  if (!wgutils()->updatePeer(config)) {
+    logger.error() << "Peer creation failed.";
+    return false;
+  }
+
+#ifdef Q_OS_WINDOWS
+  if (m_windowsManagedActivation) m_windowsDnsAttempted = true;
+#endif
+  if (!maybeUpdateResolvers(config)) {
+    return false;
+  }
+
+  // set routing
+  for (const IPAddress& ip : config.m_allowedIPAddressRanges) {
+    if (!wgutils()->updateRoutePrefix(ip)) {
+      logger.debug() << "Routing configuration failed for" << ip.toString();
+      return false;
+    }
+  }
+
+#ifdef Q_OS_WINDOWS
+  if (m_windowsManagedActivation) m_windowsUpAttempted = true;
+#endif
+  bool status = run(Up, config);
+  logger.debug() << "Connection status:" << status;
+  if (status) {
+    m_connections[config.m_hopType] = ConnectionState(config);
+    m_handshakeTimer.start(HANDSHAKE_POLL_MSEC);
+    emit_failure_guard.dismiss();
+    return true;
+  }
+  return false;
+}
+
+bool Daemon::maybeUpdateResolvers(const InterfaceConfig& config) {
+  if ((config.m_hopType == InterfaceConfig::MultiHopExit) ||
+      (config.m_hopType == InterfaceConfig::SingleHop)) {
+    QList<QHostAddress> resolvers;
+    resolvers.append(QHostAddress(config.m_primaryDnsServer));
+    if (!config.m_secondaryDnsServer.isEmpty()) {
+        resolvers.append(QHostAddress(config.m_secondaryDnsServer));
+    }
+
+    // If the DNS is not the Gateway, it's a user defined DNS
+    // thus, not add any other :)
+    if (config.m_primaryDnsServer == config.m_serverIpv4Gateway) {
+      resolvers.append(QHostAddress(config.m_serverIpv6Gateway));
+    }
+
+    if (!dnsutils()->updateResolvers(wgutils()->interfaceName(), resolvers)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// static
+bool Daemon::parseStringList(const QJsonObject& obj, const QString& name,
+                             QStringList& list) {
+  if (obj.contains(name)) {
+    QJsonValue value = obj.value(name);
+    if (!value.isArray()) {
+      logger.error() << name << "is not an array";
+      return false;
+    }
+    QJsonArray array = value.toArray();
+    for (const QJsonValue& i : array) {
+      if (!i.isString()) {
+        logger.error() << name << "must contain only strings";
+        return false;
+      }
+      list.append(i.toString());
+    }
+  }
+  return true;
+}
+
+bool Daemon::addExclusionRoute(const IPAddress& prefix) {
+  if (m_excludedAddrSet.contains(prefix)) {
+    m_excludedAddrSet[prefix]++;
+    return true;
+  }
+  if (!wgutils()->addExclusionRoute(prefix)) {
+    return false;
+  }
+  m_excludedAddrSet[prefix] = 1;
+  return true;
+}
+
+bool Daemon::delExclusionRoute(const IPAddress& prefix) {
+  Q_ASSERT(m_excludedAddrSet.contains(prefix));
+  if (m_excludedAddrSet[prefix] > 1) {
+    m_excludedAddrSet[prefix]--;
+    return true;
+  }
+  m_excludedAddrSet.remove(prefix);
+  return wgutils()->deleteExclusionRoute(prefix);
+}
+
+// static
+bool Daemon::parseConfig(const QJsonObject& obj, InterfaceConfig& config) {
+#define GETVALUE(name, where, jsontype)                           \
+  if (!obj.contains(name)) {                                      \
+    logger.debug() << name << " missing in the jsonConfig input"; \
+    return false;                                                 \
+  } else {                                                        \
+    QJsonValue value = obj.value(name);                           \
+    if (value.type() != QJsonValue::jsontype) {                   \
+      logger.error() << name << " is not a " #jsontype;           \
+      return false;                                               \
+    }                                                             \
+    where = value.to##jsontype();                                 \
+  }
+
+  GETVALUE("privateKey", config.m_privateKey, String);
+  GETVALUE("serverPublicKey", config.m_serverPublicKey, String);
+  GETVALUE("serverPort", config.m_serverPort, Double);
+
+  config.m_serverPskKey = obj.value("serverPskKey").toString();
+
+  if (!obj.contains("deviceMTU") || obj.value("deviceMTU").toString().toInt() == 0)
+  {
+    config.m_deviceMTU = 1420;
+  } else {
+    config.m_deviceMTU = obj.value("deviceMTU").toString().toInt();
+#ifdef Q_OS_WINDOWS
+// For Windows min MTU value is 1280 (the smallest MTU legal with IPv6).
+    if (config.m_deviceMTU < 1280) {
+      config.m_deviceMTU = 1280;
+    }
+#endif
+  }
+
+  config.m_persistentKeepalive = obj.value("persistentKeepalive").toString();
+
+  config.m_deviceIpv4Address = obj.value("deviceIpv4Address").toString();
+  config.m_deviceIpv6Address = obj.value("deviceIpv6Address").toString();
+  if (config.m_deviceIpv4Address.isNull() &&
+      config.m_deviceIpv6Address.isNull()) {
+    logger.warning() << "no device addresses found in jsonConfig input";
+    return false;
+  }
+  config.m_serverIpv4AddrIn = obj.value("serverIpv4AddrIn").toString();
+  config.m_serverIpv6AddrIn = obj.value("serverIpv6AddrIn").toString();
+  if (config.m_serverIpv4AddrIn.isNull() &&
+      config.m_serverIpv6AddrIn.isNull()) {
+    logger.error() << "no server addresses found in jsonConfig input";
+    return false;
+  }
+  config.m_serverIpv4Gateway = obj.value("serverIpv4Gateway").toString();
+  config.m_serverIpv6Gateway = obj.value("serverIpv6Gateway").toString();
+
+  if (!obj.contains("primaryDnsServer")) {
+    config.m_primaryDnsServer = QString();
+  } else {
+    QJsonValue value = obj.value("primaryDnsServer");
+    if (!value.isString()) {
+      logger.error() << "dnsServer is not a string";
+      return false;
+    }
+    config.m_primaryDnsServer = value.toString();
+  }
+
+  if (!obj.contains("secondaryDnsServer")) {
+    config.m_secondaryDnsServer = QString();
+  } else {
+    QJsonValue value = obj.value("secondaryDnsServer");
+    if (!value.isString()) {
+      logger.error() << "dnsServer is not a string";
+      return false;
+    }
+    config.m_secondaryDnsServer = value.toString();
+  }
+
+  if (!obj.contains("hopType")) {
+    config.m_hopType = InterfaceConfig::SingleHop;
+  } else {
+    QJsonValue value = obj.value("hopType");
+    if (!value.isString()) {
+      logger.error() << "hopType is not a string";
+      return false;
+    }
+
+    bool okay;
+    QByteArray vdata = value.toString().toUtf8();
+    QMetaEnum meta = QMetaEnum::fromType<InterfaceConfig::HopType>();
+    config.m_hopType =
+        InterfaceConfig::HopType(meta.keyToValue(vdata.constData(), &okay));
+    if (!okay) {
+      logger.error() << "hopType" << value.toString() << "is not valid";
+      return false;
+    }
+  }
+
+  if (!obj.contains(JSON_ALLOWEDIPADDRESSRANGES)) {
+    logger.error() << JSON_ALLOWEDIPADDRESSRANGES
+                   << "missing in the jsonconfig input";
+    return false;
+  } else {
+    QJsonValue value = obj.value(JSON_ALLOWEDIPADDRESSRANGES);
+    if (!value.isArray()) {
+      logger.error() << JSON_ALLOWEDIPADDRESSRANGES << "is not an array";
+      return false;
+    }
+
+    QJsonArray array = value.toArray();
+    for (const QJsonValue& i : array) {
+      if (!i.isObject()) {
+        logger.error() << JSON_ALLOWEDIPADDRESSRANGES
+                       << "must contain only objects";
+        return false;
+      }
+
+      QJsonObject ipObj = i.toObject();
+
+      QJsonValue address = ipObj.value("address");
+      if (!address.isString()) {
+        logger.error() << JSON_ALLOWEDIPADDRESSRANGES
+                       << "objects must have a string address";
+        return false;
+      }
+
+      QJsonValue range = ipObj.value("range");
+      if (!range.isDouble()) {
+        logger.error() << JSON_ALLOWEDIPADDRESSRANGES
+                       << "object must have a numberic range";
+        return false;
+      }
+
+      QJsonValue isIpv6 = ipObj.value("isIpv6");
+      if (!isIpv6.isBool()) {
+        logger.error() << JSON_ALLOWEDIPADDRESSRANGES
+                       << "object must have a boolean isIpv6";
+        return false;
+      }
+
+      config.m_allowedIPAddressRanges.append(
+          IPAddress(QHostAddress(address.toString()), range.toInt()));
+    }
+
+    // Sort allowed IPs by decreasing prefix length.
+    std::sort(config.m_allowedIPAddressRanges.begin(),
+              config.m_allowedIPAddressRanges.end(),
+              [&](const IPAddress& a, const IPAddress& b) -> bool {
+                return a.prefixLength() > b.prefixLength();
+              });
+  }
+
+  if (!parseStringList(obj, "excludedAddresses", config.m_excludedAddresses)) {
+    return false;
+  }
+  if (!parseStringList(obj, "vpnDisabledApps", config.m_vpnDisabledApps)) {
+    return false;
+  }
+  if (!parseStringList(obj, "allowedDnsServers", config.m_allowedDnsServers)) {
+    return false;
+  }
+
+  config.m_killSwitchEnabled = QVariant(obj.value("killSwitchOption").toString()).toBool();
+
+  if (const auto jc = obj.value("Jc"); !jc.isUndefined()) {
+    config.m_junkPacketCount = jc.toString();
+  }
+  if (const auto jmin = obj.value("Jmin"); !jmin.isUndefined()) {
+    config.m_junkPacketMinSize = jmin.toString();
+  }
+  if (const auto jmax = obj.value("Jmax"); !jmax.isUndefined()) {
+    config.m_junkPacketMaxSize = jmax.toString();
+  }
+  if (const auto s1 = obj.value("S1"); !s1.isUndefined()) {
+    config.m_initPacketJunkSize = s1.toString();
+  }
+  if (const auto s2 = obj.value("S2"); !s2.isUndefined()) {
+    config.m_responsePacketJunkSize = s2.toString();
+  }
+  if (const auto s3 = obj.value("S3"); !s3.isUndefined()) {
+    config.m_cookieReplyPacketJunkSize = s3.toString();
+  }
+  if (const auto s4 = obj.value("S4"); !s4.isUndefined()) {
+    config.m_transportPacketJunkSize = s4.toString();
+  }
+
+  if (const auto h1 = obj.value("H1"); !h1.isUndefined()) {
+    config.m_initPacketMagicHeader = h1.toString();
+  }
+  if (const auto h2 = obj.value("H2"); !h2.isUndefined()) {
+    config.m_responsePacketMagicHeader = h2.toString();
+  }
+  if (const auto h3 = obj.value("H3"); !h3.isUndefined()) {
+    config.m_underloadPacketMagicHeader = h3.toString();
+  }
+  if (const auto h4 = obj.value("H4"); !h4.isUndefined()) {
+    config.m_transportPacketMagicHeader = h4.toString();
+  }
+
+  if (const auto i1 = obj.value("I1"); !i1.isUndefined()) {
+    config.m_specialJunk["I1"] = i1.toString();
+  }
+  if (const auto i2 = obj.value("I2"); !i2.isUndefined()) {
+    config.m_specialJunk["I2"] = i2.toString();
+  }
+  if (const auto i3 = obj.value("I3"); !i3.isUndefined()) {
+    config.m_specialJunk["I3"] = i3.toString();
+  }
+  if (const auto i4 = obj.value("I4"); !i4.isUndefined()) {
+    config.m_specialJunk["I4"] = i4.toString();
+  }
+  if (const auto i5 = obj.value("I5"); !i5.isUndefined()) {
+    config.m_specialJunk["I5"] = i5.toString();
+  }
+
+  if (const auto headerProtectionKey = obj.value("HeaderProtectionKey"); !headerProtectionKey.isUndefined()) {
+    config.m_headerProtectionKey = headerProtectionKey.toString();
+  }
+  if (const auto contentPaddingAddition = obj.value("ContentPaddingAddition"); !contentPaddingAddition.isUndefined()) {
+    config.m_contentPaddingAddition = contentPaddingAddition.toString();
+  }
+  if (const auto rekeyAfterTime = obj.value("RekeyAfterTime"); !rekeyAfterTime.isUndefined()) {
+    config.m_rekeyAfterTime = rekeyAfterTime.toString();
+  }
+  if (const auto rekeyTimeout = obj.value("RekeyTimeout"); !rekeyTimeout.isUndefined()) {
+    config.m_rekeyTimeout = rekeyTimeout.toString();
+  }
+  if (const auto rejectAfterTime = obj.value("RejectAfterTime"); !rejectAfterTime.isUndefined()) {
+    config.m_rejectAfterTime = rejectAfterTime.toString();
+  }
+  if (const auto keepaliveTimeout = obj.value("KeepaliveTimeout"); !keepaliveTimeout.isUndefined()) {
+    config.m_keepaliveTimeout = keepaliveTimeout.toString();
+  }
+  if (const auto maxHandshakeAttempts = obj.value("MaxHandshakeAttempts"); !maxHandshakeAttempts.isUndefined()) {
+    config.m_maxHandshakeAttempts = maxHandshakeAttempts.toString();
+  }
+  if (const auto randomTrailers = obj.value("RandomTrailers"); !randomTrailers.isUndefined()) {
+    config.m_randomTrailers = randomTrailers.toString();
+  }
+  if (const auto disableCookies = obj.value("DisableCookies"); !disableCookies.isUndefined()) {
+    config.m_disableCookies = disableCookies.toString();
+  }
+
+  return true;
+}
+
+bool Daemon::managedDeactivate(const QString& identity) {
+  // Ownership test precedes any native mutation, including context invalidation.
+#ifdef Q_OS_WINDOWS
+  if (!identity.isEmpty() && identity == m_windowsLastStoppedIdentity &&
+      m_controlIdentity.isEmpty() && !m_teardownUncertain &&
+      m_connections.isEmpty() && !wgutils()->interfaceExists()) return true;
+#endif
+  if (identity.isEmpty() || identity != m_controlIdentity) return false;
+  return deactivate(false);
+}
+QJsonObject Daemon::managedInspection() {
+  QString state = QStringLiteral("unknown");
+  if (!m_controlIdentity.isEmpty()
+#ifdef Q_OS_WINDOWS
+      && !m_teardownUncertain
+#endif
+      ) state = QStringLiteral("active");
+  else if (!m_teardownUncertain && m_connections.isEmpty() && !wgutils()->interfaceExists()) state = QStringLiteral("off");
+  return QJsonObject{{"state", state}, {"controlIdentity", m_controlIdentity}};
+}
+
+#ifdef Q_OS_WINDOWS
+bool Daemon::cleanupWindowsManagedActivation() {
+  Q_ASSERT(m_windowsCleanupConfig);
+  m_healthContextId.clear();
+  m_handshakeTimer.stop();
+  m_teardownUncertain = true;
+  bool success = true;
+  if (m_windowsUpAttempted) {
+    if (run(Down, *m_windowsCleanupConfig)) m_windowsUpAttempted = false;
+    else success = false;
+  }
+  // Removing the owned Windows interface also removes its peers/IPs/routes.
+  // WireguardUtils retains monitor/firewall inputs until their cleanup succeeds.
+  if (m_windowsInterfaceAttempted) {
+    if (wgutils()->deleteInterface()) m_windowsInterfaceAttempted = false;
+    else success = false;
+  }
+  if (m_windowsDnsAttempted) {
+    if (dnsutils()->restoreResolvers()) m_windowsDnsAttempted = false;
+    else success = false;
+  }
+  if (success) {
+    m_windowsLastStoppedIdentity = m_controlIdentity;
+    m_controlIdentity.clear();
+    m_connections.clear();
+    m_excludedAddrSet.clear();
+    m_windowsCleanupConfig.reset();
+    m_teardownUncertain = false;
+  }
+  return success;
+}
+#endif
+
+bool Daemon::deactivate(bool emitSignals) {
+#ifdef Q_OS_WINDOWS
+  if (m_windowsCleanupConfig) {
+    const bool success = cleanupWindowsManagedActivation();
+    if (emitSignals && success) emit disconnected();
+    return success;
+  }
+#endif
+  m_healthContextId.clear();
+  m_teardownUncertain = true;
+  bool success = true;
+  Q_ASSERT(wgutils() != nullptr);
+
+  // Deactivate the main interface.
+  if (!m_connections.isEmpty()) {
+    const ConnectionState& state = m_connections.first();
+    if (!run(Down, state.m_config)) {
+      return false;
+    }
+  }
+
+  // Cleanup DNS
+  if (!dnsutils()->restoreResolvers()) {
+    logger.warning() << "Failed to restore DNS resolvers.";
+    success = false;
+  }
+
+  // Cleanup peers and routing
+  for (const ConnectionState& state : m_connections) {
+    const InterfaceConfig& config = state.m_config;
+    logger.debug() << "Deleting routes for" << config.m_hopType;
+    for (const IPAddress& ip : config.m_allowedIPAddressRanges) {
+      success = wgutils()->deleteRoutePrefix(ip) && success;
+    }
+    success = wgutils()->deletePeer(config) && success;
+  }
+
+  // Cleanup routing for excluded addresses.
+  for (auto iterator = m_excludedAddrSet.constBegin();
+       iterator != m_excludedAddrSet.constEnd(); ++iterator) {
+    success = wgutils()->deleteExclusionRoute(iterator.key()) && success;
+  }
+  // Retain teardown inputs after partial failure for exact cleanup retry.
+  // Delete the interface
+  success = wgutils()->deleteInterface() && success;
+  m_teardownUncertain = !success;
+  if (success) { m_controlIdentity.clear(); m_excludedAddrSet.clear(); m_connections.clear(); }
+  if (emitSignals && success) emit disconnected();
+  return success;
+}
+
+QString Daemon::logs() {
+  return {};
+}
+
+void Daemon::cleanLogs() { }
+
+bool Daemon::supportServerSwitching(const InterfaceConfig& config) const {
+  if (!m_connections.contains(config.m_hopType)) {
+    return false;
+  }
+  const InterfaceConfig& current =
+      m_connections.value(config.m_hopType).m_config;
+
+  return current.m_privateKey == config.m_privateKey &&
+         current.m_deviceIpv4Address == config.m_deviceIpv4Address &&
+         current.m_deviceIpv6Address == config.m_deviceIpv6Address &&
+         current.m_serverIpv4Gateway == config.m_serverIpv4Gateway &&
+         current.m_serverIpv6Gateway == config.m_serverIpv6Gateway;
+}
+
+bool Daemon::switchServer(const InterfaceConfig& config) {
+  Q_ASSERT(wgutils() != nullptr);
+
+  logger.debug() << "Switching server for" << config.m_hopType;
+
+  Q_ASSERT(m_connections.contains(config.m_hopType));
+  const InterfaceConfig& lastConfig =
+      m_connections.value(config.m_hopType).m_config;
+
+  // Configure routing for new excluded addresses.
+  for (const QString& i : config.m_excludedAddresses) {
+    addExclusionRoute(IPAddress(i));
+  }
+
+  // Activate the new peer and its routes.
+  if (!wgutils()->updatePeer(config)) {
+    logger.error() << "Server switch failed to update the wireguard interface";
+    return false;
+  }
+  for (const IPAddress& ip : config.m_allowedIPAddressRanges) {
+    if (!wgutils()->updateRoutePrefix(ip)) {
+      logger.error() << "Server switch failed to update the routing table";
+      break;
+    }
+  }
+
+  // Remove routing entries for the old peer.
+  for (const QString& i : lastConfig.m_excludedAddresses) {
+    delExclusionRoute(QHostAddress(i));
+  }
+  for (const IPAddress& ip : lastConfig.m_allowedIPAddressRanges) {
+    if (!config.m_allowedIPAddressRanges.contains(ip)) {
+      wgutils()->deleteRoutePrefix(ip);
+    }
+  }
+
+  // Remove the old peer if it is no longer necessary.
+  if (config.m_serverPublicKey != lastConfig.m_serverPublicKey) {
+    if (!wgutils()->deletePeer(lastConfig)) {
+      return false;
+    }
+  }
+
+  m_connections[config.m_hopType] = ConnectionState(config);
+  return true;
+}
+
+QJsonObject Daemon::getStatus() {
+  Q_ASSERT(wgutils() != nullptr);
+  QJsonObject json;
+  logger.debug() << "Status request";
+  json.insert("healthContextId", m_healthContextId);
+  json.insert("generation", QString::number(m_healthGeneration));
+
+  if (
+#ifdef Q_OS_WINDOWS
+      m_teardownUncertain ||
+#endif
+      !wgutils()->interfaceExists() || m_connections.isEmpty()) {
+    json.insert("connected", QJsonValue(false));
+    json.insert("healthValid", QJsonValue(false));
+    return json;
+  }
+
+  // The context belongs to the successfully activated hop, never another map entry.
+  const auto active = m_connections.constFind(m_healthHopType);
+  const ConnectionState& connection = !m_healthContextId.isEmpty() && active != m_connections.cend()
+      ? active.value() : m_connections.first();
+  if (active == m_connections.cend()) json.insert("healthContextId", QString());
+  QList<WireguardUtils::PeerStatus> peers = wgutils()->getPeerStatus();
+  for (const WireguardUtils::PeerStatus& status : peers) {
+    if (status.m_pubkey != connection.m_config.m_serverPublicKey) {
+      continue;
+    }
+    json.insert("connected", QJsonValue(status.m_handshake > 0));
+    json.insert("serverIpv4Gateway",
+                QJsonValue(connection.m_config.m_serverIpv4Gateway));
+    json.insert("deviceIpv4Address",
+                QJsonValue(connection.m_config.m_deviceIpv4Address));
+    json.insert("date", connection.m_date.toString());
+    json.insert("txBytes", QJsonValue(status.m_txBytes));
+    json.insert("rxBytes", QJsonValue(status.m_rxBytes));
+    QString endpoint = connection.m_config.m_serverIpv4AddrIn;
+    if (endpoint.isEmpty()) endpoint = connection.m_config.m_serverIpv6AddrIn;
+    if (endpoint.contains(':') && !endpoint.startsWith('[')) endpoint = '[' + endpoint + ']';
+    endpoint += QStringLiteral(":") + QString::number(connection.m_config.m_serverPort);
+    json.insert("peerPublicKey", QString::fromLatin1(
+                    QByteArray::fromBase64(status.m_pubkey.toLatin1()).toHex()));
+    json.insert("endpoint", endpoint);
+    json.insert("localAddress", connection.m_config.m_deviceIpv4Address);
+    json.insert("interfaceName", wgutils()->interfaceName());
+    json.insert("latestHandshakeEpochMs", QString::number(status.m_handshake));
+    json.insert("rxTotal", QString::number(status.m_rxBytes));
+    json.insert("txTotal", QString::number(status.m_txBytes));
+    json.insert("healthValid", status.m_statsValid && status.m_handshake >= 0 &&
+                    !endpoint.isEmpty() && !connection.m_config.m_deviceIpv4Address.isEmpty());
+    return json;
+  }
+
+  json.insert("connected", QJsonValue(false));
+  json.insert("healthValid", QJsonValue(false));
+  return json;
+}
+
+void Daemon::checkHandshake() {
+  Q_ASSERT(wgutils() != nullptr);
+
+  logger.debug() << "Checking for handshake...";
+
+  int pendingHandshakes = 0;
+  QList<WireguardUtils::PeerStatus> peers = wgutils()->getPeerStatus();
+  for (ConnectionState& connection : m_connections) {
+    const InterfaceConfig& config = connection.m_config;
+    if (connection.m_date.isValid()) {
+      continue;
+    }
+    logger.debug() << "awaiting" << config.m_serverPublicKey;
+
+    // Check if the handshake has completed.
+    for (const WireguardUtils::PeerStatus& status : peers) {
+      if (config.m_serverPublicKey != status.m_pubkey) {
+        continue;
+      }
+      if (status.m_handshake != 0) {
+        connection.m_date.setMSecsSinceEpoch(status.m_handshake);
+        emit connected(status.m_pubkey);
+      }
+    }
+
+    if (!connection.m_date.isValid()) {
+      pendingHandshakes++;
+    }
+  }
+
+  // Check again if there were connections that haven't completed a handshake.
+  if (pendingHandshakes > 0) {
+    m_handshakeTimer.start(HANDSHAKE_POLL_MSEC);
+  }
+}

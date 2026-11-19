@@ -1,0 +1,116 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Window
+import Style 1.0
+import "../Controls2/TextTypes"
+import "../newComponents/Mayak"
+import "../MayakCity/MayakCity.js" as CityData
+
+Button {
+    id: root
+
+    property bool connected: ConnectionController.isConnected
+    property bool inProgress: ConnectionController.isConnectionInProgress
+    readonly property string archivePhase: {
+        if (ConnectionController.cleanupPending) return "CleanupPending"
+        switch (ConnectionController.connectionPhase) {
+        case "preparing": return "Preparing"
+        case "fetching": return "Fetching"
+        case "admitting": return "Admitting"
+        case "starting": return "Starting"
+        case "verifying": return "Verifying"
+        case "connected": return "Connected"
+        case "stopping": return "Stopping"
+        case "failed": return "Failed"
+        case "cancelled": return "Cancelled"
+        default: return "Idle"
+        }
+    }
+    property bool beamSettled: false
+    property bool citySceneActive: false
+    // Immutable selected-exit data is passed from PageHome; never infer a city.
+    property var exitLocation: ({ candidateId: "", cityId: "" })
+    readonly property bool showUnknownCityCard: connected && archivePhase === "Connected" && beamSettled
+                                                && !CityData.hasCity(exitLocation)
+    onArchivePhaseChanged: if (archivePhase !== "Connected") beamSettled = false
+    // Scene size is independent of the action label and adapts to the home viewport.
+    property real beaconDiameter: 204
+    // The home scene uses the actual wrapped action label when fitting a
+    // compact connected viewport, without estimating its font metrics.
+    readonly property real actionLabelHeight: label.implicitHeight
+    readonly property real actionLabelSpacing: 16
+    readonly property bool motionActive: Qt.application.state === Qt.ApplicationActive
+                                        && root.Window.window !== null
+                                        && root.Window.window.visibility !== Window.Minimized
+
+    implicitWidth: Math.max(204, beaconDiameter)
+    implicitHeight: beaconDiameter + actionLabelSpacing + actionLabelHeight
+    padding: 0
+    hoverEnabled: true
+    text: ConnectionController.connectionStateText
+
+    Connections {
+        target: ConnectionController
+        function onPreparingConfig() {
+            PageController.showNotificationMessage(qsTr("Unable to disconnect during configuration preparation"))
+        }
+    }
+
+    background: Item {}
+    contentItem: Item {
+        MayakBeacon {
+            id: beacon
+            objectName: "mayak-beacon-decoration"
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: root.beaconDiameter
+            height: width
+            phase: root.archivePhase
+            active: root.motionActive
+            reduceMotion: AmneziaStyle.mayakReduceMotion
+            day: AmneziaStyle.mayakDay
+            // Day beacon is cool grey, so its idle ring is a cool grey too.
+            ringOffColor: AmneziaStyle.mayakDay ? "#98a0b1" : AmneziaStyle.color.mayakLineStrong
+            scale: root.down ? 0.97 : 1
+            opacity: root.down ? 0.90 : 1
+            Behavior on scale { NumberAnimation { duration: AmneziaStyle.mayakReduceMotion ? 0 : (root.down ? 90 : 120); easing.type: Easing.OutQuad } }
+            Behavior on opacity { NumberAnimation { duration: AmneziaStyle.mayakReduceMotion ? 0 : (root.down ? 90 : 120) } }
+        }
+        Rectangle {
+            anchors.centerIn: beacon
+            width: beacon.width + 8
+            height: width
+            radius: width / 2
+            color: "transparent"
+            border.width: 2
+            border.color: AmneziaStyle.color.mayakFocus
+            visible: root.visualFocus
+        }
+        ButtonTextType {
+            id: label
+            objectName: "mayak-main-connect-label"
+            y: root.beaconDiameter + root.actionLabelSpacing
+            width: parent.width
+            height: implicitHeight
+            text: root.text
+            color: root.citySceneActive && !AmneziaStyle.mayakDay ? "#ECEFF6" : AmneziaStyle.color.mayakInk
+            style: root.citySceneActive ? Text.Outline : Text.Normal
+            styleColor: AmneziaStyle.mayakDay ? "#99F5F3EE" : "#99070C18"
+            lineHeight: 30 + LanguageUiController.getLineHeightAppend()
+            font.pixelSize: 20
+            font.weight: 700
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            wrapMode: Text.WordWrap
+        }
+    }
+
+    Connections {
+        target: beacon
+        function onBeamSettled() { root.beamSettled = true }
+    }
+
+    HoverHandler { cursorShape: Qt.PointingHandCursor }
+    onClicked: ConnectionController.connectButtonClicked()
+    Keys.onEnterPressed: root.clicked()
+    Keys.onReturnPressed: root.clicked()
+}
