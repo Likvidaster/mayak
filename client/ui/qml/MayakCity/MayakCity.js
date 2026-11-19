@@ -104,6 +104,12 @@ function cityForId(id) {
     return cityIds.indexOf(id) >= 0 ? cities[id] : null
 }
 
+// Short nominative name of a built-in city for the status line («Осло · AmneziaWG»), or "".
+var cityNames = ({ oslo: "Осло", helsinki: "Хельсинки", amsterdam: "Амстердам", frankfurt: "Франкфурт", stockholm: "Стокгольм" })
+function cityName(id) {
+    return typeof id === "string" && cityIds.indexOf(id) >= 0 ? cityNames[id] : ""
+}
+
 // Admin city card from the server (exit_location schema 2), already validated by the client.
 // Only for the selected exit (candidateId present); otherwise null.
 function serverCard(location) {

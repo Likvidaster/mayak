@@ -28,6 +28,14 @@
 #include "mayakForeignVpn.h"
 #include "secureQSettings.h"
 #include <map>
+#ifdef Q_OS_ANDROID
+#include <cstdlib>
+#include <dirent.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace ac = mayak::autoconnect;
 namespace ad = mayak::admission;
@@ -55,6 +63,61 @@ constexpr qint64 kAvoidExitMs = 10 * 60 * 1000;
 constexpr qint64 kXrayFirstMs = 12 * 60 * 60 * 1000;
 const char* kPathMemoryKey = "Mayak/pathMemory";
 const char* kPathSaltKey = "Mayak/pathMemorySalt";
+// Android: a just-started Xray tunnel's VPN network is not visible to ConnectivityManager for a
+// moment, so the probe's strict socket bind fails at once (exact text from mayakTunnelProbe.cpp).
+// Only this failure is retried, after this delay, within the path's own proof time.
+const QLatin1String kAndroidVpnBindFailed("strict Android VPN socket binding failed");
+constexpr int kXrayBindRetryMs = 250;
+// A bind that still fails this long after the first failure is not a VPN network still coming up:
+// the path fails as before instead of using its whole proof time.
+constexpr qint64 kXrayBindRetryBudgetMs = 3000;
+// Android (19.11 log): gateway requests go through libagw (Go net/http), whose connection pool is
+// shared by the whole process. A connection opened while a tunnel ran is tied to that VPN network;
+// after the tunnel stops or the network changes it silently black-holes, and every later request
+// waits on it until timeout («Нет связи с сервером Маяка», a disconnect that never finishes) until
+// the app restarts. libagw has no API to drop it, so the app shuts down its own TCP sockets to
+// port 443 (never loopback) at these points: the HTTP client then sees an error and reconnects.
+// Only this app process is touched; the VPN services run in their own processes.
+int shutdownOwnHttpsSockets() {
+#ifdef Q_OS_ANDROID
+    DIR* dir=::opendir("/proc/self/fd");
+    if (!dir) return -1;
+    const int own=::dirfd(dir);
+    int closed=0;
+    while (dirent* entry=::readdir(dir)) {
+        char* end=nullptr;
+        const long value=std::strtol(entry->d_name,&end,10);
+        if (!end || *end!='\0' || end==entry->d_name || value<0 || value==own) continue;
+        const int fd=int(value);
+        struct stat st{};
+        if (::fstat(fd,&st)!=0 || !S_ISSOCK(st.st_mode)) continue;
+        int type=0; socklen_t typeLength=sizeof(type);
+        if (::getsockopt(fd,SOL_SOCKET,SO_TYPE,&type,&typeLength)!=0 || type!=SOCK_STREAM) continue;
+        sockaddr_storage peer{}; socklen_t peerLength=sizeof(peer);
+        if (::getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerLength)!=0) continue;
+        if (peer.ss_family==AF_INET) {
+            const auto* v4=reinterpret_cast<const sockaddr_in*>(&peer);
+            if (ntohs(v4->sin_port)!=443 || (ntohl(v4->sin_addr.s_addr)>>24)==127) continue;
+        } else if (peer.ss_family==AF_INET6) {
+            const auto* v6=reinterpret_cast<const sockaddr_in6*>(&peer);
+            if (ntohs(v6->sin6_port)!=443 || IN6_IS_ADDR_LOOPBACK(&v6->sin6_addr)) continue;
+            if (IN6_IS_ADDR_V4MAPPED(&v6->sin6_addr) && v6->sin6_addr.s6_addr[12]==127) continue;
+        } else continue;
+        if (::shutdown(fd,SHUT_RDWR)==0) ++closed;
+    }
+    ::closedir(dir);
+    return closed;
+#else
+    return 0;
+#endif
+}
+std::function<int()>& httpsSocketResetStorage() { static std::function<int()> hook=shutdownOwnHttpsSockets; return hook; }
+// A tunnel started (or was adopted) since the last reset: only then can the app's HTTPS connections
+// be tied to a VPN network that is gone. Without it (e.g. an update download started while no VPN
+// ran) nothing is reset at connect, reconnect or release. A fresh app process starts "stale": on
+// Android the VPN services run in their own processes, so this process may have been restarted
+// while a tunnel ran and its first gateway requests went through it.
+bool& httpsSocketsMayBeStale() { static bool stale=true; return stale; }
 QString localNetworkKey(SecureQSettings* settings) {
     if (!settings) return {};
     QString salt = settings->value(kPathSaltKey).toString();
@@ -216,6 +279,8 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         bool inFlight = false;
     } rec;
     QVariantMap connectedLocation;
+    // Last coordinator attempt/path, for the status line (which exit, which method).
+    ac::CycleId routeCycle = 0; ac::AttemptId routeAttempt = 0; std::string routePathId;
     struct XrayEntry { ad::XrayPath path; ad::XrayPathConfig config; };
     struct Attempt {
         at::AttemptIdentity identity;
@@ -225,6 +290,8 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         std::vector<XrayEntry> xray;              // validated Xray paths of this allocation
         bool awgFailedHere = false;               // an AWG path of this allocation did not prove
         qint64 probeStartedMono = 0;
+        int xrayBindRetries = 0;                  // Xray proof probes repeated after a VPN bind failure
+        qint64 xrayBindFirstFailMono = 0;         // first bind failure of this path (bounds the retries)
         QString allocation;
         QString encodedConfig;
         QString exitLocationCityId;
@@ -323,7 +390,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             // Retry starts only after exact release acknowledgement and fresh fetch.
             if (reconnectWanted && coordinator && coordinator->status().state == ac::State::Failed && !inFlight) {
                 const auto loaded=store->load();
-                if (loaded.ok && loaded.records.isEmpty()) { reconnectWanted=false; terminal=false; coordinator->begin(); }
+                if (loaded.ok && loaded.records.isEmpty()) { reconnectWanted=false; terminal=false; resetHttpsSockets("reconnect"); coordinator->begin(); }
             }
             // Scheduled connect retry after a network failure: same release barrier as above.
             if (connectRetryAt && now()>=connectRetryAt && coordinator && !cancelled &&
@@ -332,6 +399,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                 if (loaded.ok && loaded.records.isEmpty()) {
                     connectRetryAt=0; terminal=false;
                     logNet(QStringLiteral("event=connect_retry_start retry=%1 local_retry=%2").arg(connectRetries).arg(localStartRetries));
+                    resetHttpsSockets("connect_retry",true); // the gateway did not answer: never wait on the same connection
                     coordinator->begin();
                 } else if (now()>=connectRetryAt+10000) {
                     // An unreleased attempt blocks a fresh cycle: never spin in "retrying" forever.
@@ -402,7 +470,19 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
     ac::Millis now() const override { return B::monotonicMillis(); }
     QString phase = QStringLiteral("preparing");
     void output(Vpn::ConnectionState state,QString text, QVariantMap exitLocation = {}) {
-        if (facade) facade->publish(state,text,phase,exitLocation);
+        if (facade) facade->publish(state,text,phase,exitLocation,routeFor(state));
+    }
+    // The exit (as the acquire answered it) and the method of the current path. Only while a path
+    // is being started/verified or is connected; before an exit is admitted nothing is known.
+    QVariantMap routeFor(Vpn::ConnectionState state) {
+        if (state!=Vpn::ConnectionState::Connecting && state!=Vpn::ConnectionState::Connected) return {};
+        const auto a=get(routeCycle,routeAttempt);
+        if (!a || routePathId.empty()) return {};
+        const QString path=QString::fromStdString(routePathId);
+        QVariantMap route{{QStringLiteral("cityId"),a->exitLocationCityId},
+            {QStringLiteral("method"),path.startsWith(QStringLiteral("xray")) ? QStringLiteral("Xray") : QStringLiteral("AmneziaWG")}};
+        if (a->exitLocationHasCard) route.insert(QStringLiteral("city"),a->exitLocationCard.city);
+        return route;
     }
     bool identityCurrent() const {
         if (!facade || !servers || !app || !connection || cancelled || app->mayakSessionToken().isEmpty()) return false;
@@ -483,8 +563,18 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             self->beginCoordinatorAfterPreflight();
         });
     }
+    // See shutdownOwnHttpsSockets(): drop gateway connections that may be tied to a stopped tunnel.
+    // Only after a tunnel ran since the last reset, unless forced (the gateway did not answer).
+    void resetHttpsSockets(const char* reason,bool force=false) {
+        if (!force && !httpsSocketsMayBeStale()) return;
+        httpsSocketsMayBeStale()=false;
+        const auto& hook=httpsSocketResetStorage();
+        const int closed=hook ? hook() : 0;
+        if (closed!=0) logNet(QStringLiteral("event=https_sockets_reset reason=%1 closed=%2").arg(QLatin1String(reason)).arg(closed));
+    }
     void initialize() {
         auto self=shared_from_this();
+        resetHttpsSockets("connect");
         output(Vpn::ConnectionState::Preparing,QStringLiteral("Проверяем доступ…"));
         if (!facade || !servers || !app || app->mayakSessionToken().isEmpty()) { failure(QStringLiteral("Войдите в личный кабинет Маяка.")); return; }
         const auto cfg=servers->apiV2Config(serverId);
@@ -569,6 +659,8 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                     self->cleanupOperation=false;
                     if (r.outcome==B::Outcome::ConfirmedDown && ticket.same(r.ticket)) {
                         self->preflightNativeOff=true;
+                        // A running tunnel found at preflight is down now: drop connections made through it.
+                        httpsSocketsMayBeStale()=true; self->resetHttpsSockets("preflight_stop");
                         if (self->cancelled) {
                             if (!self->finishCleanup()) self->cleanupPending=true;
                         } else if (!self->terminal) self->reconcileNext();
@@ -633,6 +725,8 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                 self->abandonUnconfirmed=true; if (then) then(false); return;
             }
             self->preflightNativeOff=true;
+            // The abandoned adopted tunnel is down: drop connections made through it before reconcile.
+            httpsSocketsMayBeStale()=true; self->resetHttpsSockets("adopt_abandon");
             const auto loaded=self->store->load();
             if (!loaded.ok) { if (then) then(false); return; }
             const auto it=std::find_if(loaded.records.begin(),loaded.records.end(),[&](const at::AttemptRecord& x){ return x.identity()==identity; });
@@ -711,6 +805,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
     void state(const ac::Status& s) {
         // Copy the typed coordinator state on its owning thread. Consumers see
         // only this immutable value, never the coordinator or its session.
+        routeCycle=s.cycle; routeAttempt=s.attempt; routePathId=s.pathId;
         switch(s.state) {
         case ac::State::Idle: phase=QStringLiteral("idle"); break;
         case ac::State::Fetching: phase=QStringLiteral("fetching"); break;
@@ -1198,6 +1293,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             a->started=false; a->stopped=false; a->cancelled=false; a->stopTicket={};
             a->health={}; a->healthAt=0; a->expected={}; a->reset=false; a->rxChangedAt=0; a->replacementAllowedUntil=0;
             a->proofDone={}; a->probing=false; a->tlsOk=false; a->proof={};
+            a->xrayBindRetries=0; a->xrayBindFirstFailMono=0;
         }
         ++a->pathStarts; a->path=path;
     }
@@ -1238,7 +1334,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             !identityCurrent() || !store->markMayHaveStarted(a->identity).ok) {
             done(c,n,{ac::StartStatus::MalformedConfig}); return;
         }
-        a->started=true; a->startMono=now(); a->startUtc=QDateTime::currentMSecsSinceEpoch();
+        a->started=true; a->startMono=now(); a->startUtc=QDateTime::currentMSecsSinceEpoch(); httpsSocketsMayBeStale()=true;
         bridge->startPrepared(a->ticket,serverId,config,qMin<qint64>(deadline,a->connectBefore),[self,a,c,n,done](B::Result r) {
             a->expected=r.expected;
             done(c,n,{r.outcome==B::Outcome::Started?ac::StartStatus::Started:ac::StartStatus::NetworkError});
@@ -1262,7 +1358,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                 } else {
                     // Unconfirmed: the coordinator's stop must not claim it is down, and it must
                     // retry with the authority that still owns the backend (the recovery ticket).
-                    a->started=true; a->stopTicket=recovery;
+                    a->started=true; a->stopTicket=recovery; httpsSocketsMayBeStale()=true;
                 }
                 done(c,n,{ac::StartStatus::MalformedConfig});
             });
@@ -1274,7 +1370,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             || !ContainerUtils::isAwgContainer(container)) { giveUp(QStringLiteral("config")); return; }
         const auto recovery=adoption.recovery; const auto controlIdentity=adoption.controlIdentity;
         adoption.pending=false; // ownership transfer in flight: this callback owns every outcome
-        a->started=true; a->startMono=now(); a->startUtc=QDateTime::currentMSecsSinceEpoch();
+        a->started=true; a->startMono=now(); a->startUtc=QDateTime::currentMSecsSinceEpoch(); httpsSocketsMayBeStale()=true;
         logNet(QStringLiteral("event=adopt_request"));
         bridge->adopt(recovery,a->ticket,controlIdentity,config,qMin<qint64>(deadline,a->connectBefore),[self,a,c,n,done,recovery](B::Result r) {
             if (r.outcome==B::Outcome::Started) {
@@ -1302,7 +1398,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
            || !ContainerUtils::isAwgContainer(container) || !store->markMayHaveStarted(a->identity).ok) {
             done(c,n,{ac::StartStatus::MalformedConfig}); return;
         }
-        a->started=true; a->startMono=now(); a->startUtc=QDateTime::currentMSecsSinceEpoch();
+        a->started=true; a->startMono=now(); a->startUtc=QDateTime::currentMSecsSinceEpoch(); httpsSocketsMayBeStale()=true;
         bridge->startPrepared(a->ticket,serverId,config,qMin<qint64>(deadline,a->connectBefore),[self,a,c,n,done](B::Result r) {
             a->expected=r.expected;
             done(c,n,{r.outcome==B::Outcome::Started?ac::StartStatus::Started:ac::StartStatus::NetworkError});
@@ -1327,8 +1423,28 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             req.interfaceName=a->health.interfaceName; req.expectedEgressIpv4=a->egress; req.nonce=a->nonce;
             req.deadlineMs=int(qBound(qint64(1),qint64(a->proofDeadline-now()),qint64(8000)));
             auto self=shared_from_this();
-            bridge->probe(a->ticket,req,a->proofDeadline,[self,a,tag](B::Ticket t,bool ok,MayakTunnelProbeProof proof,QString) {
+            bridge->probe(a->ticket,req,a->proofDeadline,[self,a,tag](B::Ticket t,bool ok,MayakTunnelProbeProof proof,QString error) {
                 if(!a->ticket.same(t) || !a->proofDone || a->cancelled) return;
+                if(!ok && error==kAndroidVpnBindFailed && !a->xrayBindFirstFailMono) a->xrayBindFirstFailMono=self->now();
+                const bool bindFailed=!ok && error==kAndroidVpnBindFailed;
+                const bool bindRetry=bindFailed && self->now()-a->xrayBindFirstFailMono<kXrayBindRetryBudgetMs &&
+                    self->now()+kXrayBindRetryMs<a->proofDeadline;
+                if(bindFailed && !bindRetry)
+                    self->logNet(QStringLiteral("event=xray_probe_bind_gave_up retries=%1").arg(a->xrayBindRetries));
+                if(bindRetry) {
+                    // Nothing was sent: a fresh probe (new start time, fresh baselines) follows after the
+                    // pause. `probing` stays set meanwhile, so health samples cannot start it early.
+                    if(++a->xrayBindRetries==1 || a->xrayBindRetries%8==0)
+                        self->logNet(QStringLiteral("event=xray_probe_bind_retry retry=%1").arg(a->xrayBindRetries));
+                    std::weak_ptr<Session> weak=self;
+                    const auto ticket=a->ticket;
+                    QTimer::singleShot(kXrayBindRetryMs,self.get(),[weak,a,tag,ticket] {
+                        auto s=weak.lock();
+                        if(!s || !a->ticket.same(ticket) || !a->proofDone || a->cancelled) return;
+                        a->probing=false; s->advanceXrayProof(tag,a);
+                    });
+                    return;
+                }
                 if(!ok) { auto done=std::move(a->proofDone); done(tag.first,tag.second,{}); return; }
                 a->tlsOk=true; a->proof=proof; self->advanceXrayProof(tag,a);
             });
@@ -1418,6 +1534,9 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             return;
         }
         qInfo() << "MayakRelease started=true";
+        // The tunnel is confirmed down: its connections are dead. The flag decides (an earlier path of
+        // this attempt or an adopted tunnel may have run even when this path never started).
+        resetHttpsSockets("tunnel_stopped");
         if (!cleanupDeadline || now()>=cleanupDeadline) cleanupDeadline=now()+10000;
         a->releasePending=true; a->releaseCallbackHandled=false; a->releaseLateHandled=false;
         auto self=shared_from_this(); ad::Request req; req.action="release"; req.attemptId=a->identity.attemptId;
@@ -1802,13 +1921,18 @@ void MayakAutoConnectRuntime::resetFailoverMemoryForTests() { avoidedExitStorage
 void MayakAutoConnectRuntime::setSplitPrepareForTests(std::function<void(QObject*, std::function<void(bool, QString)>)> hook) {
     splitPrepareStorage()=std::move(hook);
 }
+void MayakAutoConnectRuntime::setHttpsSocketResetForTests(std::function<int()> hook, bool startStale) {
+    httpsSocketResetStorage()=hook ? std::move(hook) : std::function<int()>(shutdownOwnHttpsSockets);
+    httpsSocketsMayBeStale()=startStale;
+}
 bool MayakAutoConnectRuntime::manages(const QString& id) const { return m_app && m_app->isMayakManagedServer(id); }
 bool MayakAutoConnectRuntime::busy() const { return m_session && (m_session->cleanupPending || !m_session->terminal || m_session->inFlight>0); }
 void MayakAutoConnectRuntime::publish(Vpn::ConnectionState state,const QString& text,const QString& phase,
-                                      const QVariantMap& exitLocation) {
+                                      const QVariantMap& exitLocation,const QVariantMap& route) {
     m_message=text;
     m_connectionPhase=phase;
     m_exitLocation = state == Vpn::ConnectionState::Connected ? exitLocation : QVariantMap{};
+    m_route = route;
     emit stateChanged(state,text);
 }
 void MayakAutoConnectRuntime::begin(const QString& id) {

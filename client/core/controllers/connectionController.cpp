@@ -74,6 +74,9 @@ QString ConnectionController::managedConnectionPhase() const {
 QVariantMap ConnectionController::managedExitLocation() const {
     return m_managedActive && m_mayak ? m_mayak->exitLocation() : QVariantMap{};
 }
+QVariantMap ConnectionController::managedRoute() const {
+    return m_managedActive && m_mayak ? m_mayak->route() : QVariantMap{};
+}
 bool ConnectionController::managedCleanupPending() const { return m_managedActive && m_mayak && m_mayak->cleanupPending(); }
 void ConnectionController::retryManagedCleanup() { if (managedCleanupPending()) m_mayak->retryCleanup(); }
 bool ConnectionController::canInstallUpdate() const {

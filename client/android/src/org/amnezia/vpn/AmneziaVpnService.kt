@@ -366,10 +366,19 @@ open class AmneziaVpnService : VpnService() {
         super.onDestroy()
     }
 
+    // Mayak: another of our VPN service processes (AwgService / XrayService) runs as a foreground service.
+    private fun otherVpnServiceRunning(): Boolean = runCatching {
+        val own = android.app.Application.getProcessName()
+        VpnProto.values().map { it.processName }.distinct().filter { it != own }.any { isRunning(this, it) }
+    }.getOrDefault(false)
+
     private fun stopService() {
         Log.d(TAG, "Stop service")
         // Mayak: keep a dismissible "Disconnected · Connect" in the shade after the service ends.
-        if (isDisconnected && MayakLaunch.isManagedConfigSaved(this)) serviceNotification.showDisconnected(serverName, vpnProto?.label)
+        // Not when the other Mayak VPN service (AWG <-> Xray path switch) is already running:
+        // that left "Disconnected" next to its "Connected" (two Mayak icons in the status bar).
+        if (isDisconnected && MayakLaunch.isManagedConfigSaved(this) && !otherVpnServiceRunning())
+            serviceNotification.showDisconnected(serverName, vpnProto?.label)
         // the coroutine below will be canceled during the onDestroy call
         mainScope.launch {
             delay(STOP_SERVICE_TIMEOUT)
@@ -475,6 +484,9 @@ open class AmneziaVpnService : VpnService() {
 
                 when (protocolState) {
                     CONNECTED -> {
+                        // Mayak: a "Disconnected" left by the other service of a path switch
+                        // (it may stop after this service started) never stays next to "Connected".
+                        serviceNotification.cancelDisconnected()
                         networkState.bindNetworkListener()
                         if (managedRequired) managedNetworkState.bindNetworkListener()
                         // if (isActivityConnected) launchSendingStatistics()

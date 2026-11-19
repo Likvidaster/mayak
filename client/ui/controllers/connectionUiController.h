@@ -22,6 +22,7 @@ public:
     Q_PROPERTY(QString connectionPhase READ connectionPhase NOTIFY connectionStateChanged)
     Q_PROPERTY(bool cleanupPending READ cleanupPending NOTIFY connectionStateChanged)
     Q_PROPERTY(QVariantMap exitLocation READ exitLocation NOTIFY connectionStateChanged)
+    Q_PROPERTY(QVariantMap route READ route NOTIFY connectionStateChanged)
 
     explicit ConnectionUiController(ConnectionController* connectionController,
                                     ServersController* serversController,
@@ -35,6 +36,7 @@ public:
     QString connectionPhase() const;
     bool cleanupPending() const;
     QVariantMap exitLocation() const;
+    QVariantMap route() const;
 
 public slots:
     void toggleConnection();

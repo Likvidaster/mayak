@@ -145,6 +145,11 @@ QVariantMap ConnectionUiController::exitLocation() const
     return m_connectionController->managedExitLocation();
 }
 
+QVariantMap ConnectionUiController::route() const
+{
+    return m_connectionController->managedRoute();
+}
+
 void ConnectionUiController::toggleConnection()
 {
     if (cleanupPending()) { closeConnection(); return; }

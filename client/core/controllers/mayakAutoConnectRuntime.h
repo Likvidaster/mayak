@@ -32,6 +32,9 @@ public:
     QString message() const { return m_message; }
     QString connectionPhase() const { return m_connectionPhase; }
     QVariantMap exitLocation() const { return m_exitLocation; }
+    // The exit and method of the attempt being started/verified or connected (status line under the
+    // button): {cityId, city (server card), method: "AmneziaWG"|"Xray"}; empty when not known yet.
+    QVariantMap route() const { return m_route; }
     // Connected-state monitoring and Android soft recovery timing (milliseconds).
     struct RecoveryTiming {
         qint64 monitorMs = 10000;        // healthy tunnel probe interval
@@ -71,12 +74,15 @@ public:
     static void resetFailoverMemoryForTests();
     // Replaces the service's app-exclusion preparation (Windows) in tests; empty restores the default.
     static void setSplitPrepareForTests(std::function<void(QObject*, std::function<void(bool, QString)>)> hook);
+    // Replaces the Android shutdown of the app's own HTTPS sockets in tests; empty restores the default.
+    // startStale: whether connections may already be tied to a tunnel (a fresh process: true).
+    static void setHttpsSocketResetForTests(std::function<int()> hook, bool startStale = false);
 signals:
     void stateChanged(Vpn::ConnectionState state, const QString& message);
 private:
     struct Session;
     void publish(Vpn::ConnectionState state, const QString& message, const QString& phase,
-                 const QVariantMap& exitLocation = {});
+                 const QVariantMap& exitLocation = {}, const QVariantMap& route = {});
     SecureQSettings* m_settings;
     QPointer<SecureServersRepository> m_servers;
     QPointer<SecureAppSettingsRepository> m_app;
@@ -88,4 +94,5 @@ private:
     QString m_message;
     QString m_connectionPhase = QStringLiteral("idle");
     QVariantMap m_exitLocation;
+    QVariantMap m_route;
 };

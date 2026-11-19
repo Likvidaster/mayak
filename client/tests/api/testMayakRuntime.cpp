@@ -123,6 +123,7 @@ struct World : QObject {
     // Connected-state recovery fixture: a stuck transport answers no probe and no RX.
     bool tunnelDown=false, recoverHeals=true, recoverOk=true;
     int failNextProbes=0, recovers=0;
+    int bindFailNextProbes=0; // Android: the next probes fail the strict VPN socket bind (network not visible yet)
     std::function<void(B::Ticket,bool)> observeNetwork;
     std::function<void(B::Ticket,bool,bool)> observeResume;
     std::function<void(B::Ticket)> observeUserStop;
@@ -222,6 +223,7 @@ struct World : QObject {
         };
         port.probe=[this](B::Ticket ticket,MayakTunnelProbeRequest request,qint64,B::Probed done) {
             events<<"probe";
+            if (bindFailNextProbes>0) { --bindFailNextProbes; done(ticket,false,{},QStringLiteral("strict Android VPN socket binding failed")); return; }
             bool ok=!badProof && !tunnelDown;
             if (ok && failNextProbes>0) { --failNextProbes; ok=false; }
             done(ticket,ok,{ticket.opaqueAttempt,request.nonce,"81.29.149.103",request.interfaceName,request.localAddress.toString(),true},{});
@@ -479,6 +481,7 @@ struct CoordinatorTimingGuard {
 };
 // Restores the default (service) app-exclusion preparation.
 struct SplitPrepareGuard { ~SplitPrepareGuard() { MayakAutoConnectRuntime::setSplitPrepareForTests({}); } };
+struct HttpsResetGuard { ~HttpsResetGuard() { MayakAutoConnectRuntime::setHttpsSocketResetForTests({}); } };
 class RuntimeTest : public QObject {
     Q_OBJECT
 private slots:
@@ -2306,6 +2309,120 @@ private slots:
         w.runtime->begin(w.id);
         QTRY_VERIFY_WITH_TIMEOUT(w.state==Vpn::ConnectionState::Error || w.runtime->message().contains(QStringLiteral("повторяем")),10000);
         QCOMPARE(w.xrayStarts,0);
+        settle(w);
+    }
+    void xrayProofRetriesAnAndroidVpnBindFailure() {
+        // Android (19.11 log): the probe starts ~10 ms after the Xray tunnel reports Connected and
+        // the strict VPN socket bind fails until the VPN network is visible. The same path retries.
+        FastRecoveryTiming timing;
+        World w; w.singleCandidate=true; w.offerXray=true; w.bindFailNextProbes=3;
+        w.app.setMayakConnectionMethod("xray");
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.runtime->exitLocation().value("pathId").toString(),QStringLiteral("xray-firefox"));
+        QCOMPARE(w.xrayStarts,1);                  // no path switch for a bind that was not ready
+        QVERIFY(w.events.count("probe")>=4);       // three bind failures, then the proof
+        QCOMPARE(w.bindFailNextProbes,0);
+        settle(w);
+    }
+    void httpsSocketsAreResetAtConnectAndAfterTheTunnelStops() {
+        // Android (19.11 log): a gateway connection opened while the tunnel ran black-holes after it
+        // stops. The app drops its own HTTPS sockets when a connect starts and once the tunnel is
+        // confirmed down, before the release request (which hung before).
+        FastRecoveryTiming timing;
+        World w; w.singleCandidate=true;
+        HttpsResetGuard resetGuard; // after World: the hook never outlives the world it captures
+        MayakAutoConnectRuntime::setHttpsSocketResetForTests([&w] { w.events<<"https_reset"; return 1; });
+        // No tunnel ran in this "process" yet: a connect resets nothing (an update download survives).
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.events.count("https_reset"),0);
+        // The tunnel ran and is confirmed down: reset once, before the release request.
+        settle(w);
+        QCOMPARE(w.events.count("https_reset"),1);
+        QVERIFY(w.events.lastIndexOf("down")<w.events.lastIndexOf("https_reset"));
+        QVERIFY(w.events.lastIndexOf("https_reset")<w.events.lastIndexOf("release"));
+        // Already reset after that tunnel: the next connect does not reset again.
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.events.count("https_reset"),1);
+        settle(w);
+        QCOMPARE(w.events.count("https_reset"),2);
+    }
+    void httpsSocketsAreResetAtTheFirstConnectOfAFreshProcess() {
+        // Android: the app process may restart while a tunnel runs in the service process, so its
+        // first gateway connections may go through that tunnel: the first connect resets them.
+        FastRecoveryTiming timing;
+        World w; w.singleCandidate=true;
+        HttpsResetGuard resetGuard;
+        MayakAutoConnectRuntime::setHttpsSocketResetForTests([&w] { w.events<<"https_reset"; return 1; }, true);
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.events.count("https_reset"),1);
+        QVERIFY(w.events.indexOf("https_reset")<w.events.indexOf("start"));
+        settle(w);
+    }
+    void httpsSocketsAreResetBeforeAConnectRetry() {
+        // The gateway did not answer: the retry never waits on the same connection (forced reset).
+        FastRecoveryTiming timing;
+        World w; w.failConfigCount=1;
+        HttpsResetGuard resetGuard;
+        MayakAutoConnectRuntime::setHttpsSocketResetForTests([&w] { w.events<<"https_reset"; return 1; });
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.events.count("config_fail"),1);
+        QCOMPARE(w.events.count("https_reset"),1);
+        QVERIFY(w.events.indexOf("config_fail")<w.events.indexOf("https_reset"));
+        settle(w);
+    }
+    void xrayBindFailureThatPersistsGivesUpAfterItsBudget() {
+        // A bind that keeps failing is not a VPN network still coming up: the path gives up after
+        // ~3 s (not its whole 8 s proof time) and the next path starts.
+        FastRecoveryTiming timing;
+        World w; w.singleCandidate=true; w.offerXray=true; w.bindFailNextProbes=1000;
+        w.app.setMayakConnectionMethod("xray");
+        QElapsedTimer elapsed; elapsed.start();
+        w.runtime->begin(w.id);
+        QTRY_VERIFY_WITH_TIMEOUT(w.xrayStarts>=2,6500);
+        QVERIFY(elapsed.elapsed()<6500);
+        settle(w);
+    }
+    void routeNamesTheExitAndMethodWhileConnectingAndConnected() {
+        FastRecoveryTiming timing;
+        {
+            World w; w.singleCandidate=true;
+            QStringList seen;
+            QObject::connect(w.runtime.get(),&MayakAutoConnectRuntime::stateChanged,&w,[&](Vpn::ConnectionState state,const QString&) {
+                if (state==Vpn::ConnectionState::Connecting) seen<<w.runtime->route().value("method").toString();
+            });
+            QVERIFY(w.runtime->route().isEmpty());
+            w.runtime->begin(w.id);
+            QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+            QVERIFY(seen.contains(QStringLiteral("AmneziaWG")));
+            const auto route=w.runtime->route();
+            QCOMPARE(route.value("method").toString(),QStringLiteral("AmneziaWG"));
+            QCOMPARE(route.value("cityId").toString(),w.runtime->exitLocation().value("cityId").toString());
+            settle(w);
+            QVERIFY(w.runtime->route().isEmpty());
+        }
+        {
+            World w; w.singleCandidate=true; w.offerXray=true;
+            w.app.setMayakConnectionMethod("xray");
+            w.runtime->begin(w.id);
+            QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+            QCOMPARE(w.runtime->route().value("method").toString(),QStringLiteral("Xray"));
+            settle(w);
+        }
+    }
+    void xrayProofOtherFailureStillSwitchesPath() {
+        // Any other probe failure (no TLS, wrong egress, ...) is not retried: the next path runs.
+        FastRecoveryTiming timing;
+        World w; w.singleCandidate=true; w.offerXray=true; w.failNextProbes=1;
+        w.app.setMayakConnectionMethod("xray");
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.xrayStarts,2);
+        QVERIFY(w.runtime->exitLocation().value("pathId").toString()!=QStringLiteral("xray-firefox"));
         settle(w);
     }
     void onlyXrayNeverStartsAwg() {

@@ -166,7 +166,9 @@ class AmneziaActivity : QtActivity() {
                     }
 
                     ServiceEvent.STATUS -> {
-                        pendingManagedConfig?.let { (ticket, config) ->
+                        // Mayak: a late STATUS of the service just unbound (Xray <-> AWG switch)
+                        // must not consume the start meant for the new service (the send is dropped).
+                        if (isServiceConnected) pendingManagedConfig?.let { (ticket, config) ->
                     pendingManagedConfig = null
                     if (managedStarts.accepts(ticket)) connectToVpn(config)
                 }
@@ -1009,11 +1011,21 @@ class AmneziaActivity : QtActivity() {
                     connectToVpn(vpnConfig)
                     return
                 }
-                doUnbindService()
             }
+            // Mayak: switching between AwgService and XrayService (an AWG path after an Xray one or
+            // back). start() queues the managed CONNECT only when nothing is bound, and the new
+            // service never activates managed work from its start intent, so the CONNECT was lost:
+            // the path timed out without starting. Queue it for the new binding.
+            val managedTicket = runCatching { JSONObject(vpnConfig).optString("managedTicket") }.getOrDefault("")
+            if (managedTicket.isNotBlank()) pendingManagedConfig = managedTicket to vpnConfig
+            // Also drop a binding to the other service that is still being established.
+            if (isServiceConnected || (isInBoundState && proto.serviceClass != vpnProto?.serviceClass)) doUnbindService()
             vpnProto = proto
             isWaitingStatus = false
-            if (!startVpnService(vpnConfig, proto)) return
+            if (!startVpnService(vpnConfig, proto)) {
+                pendingManagedConfig = null // the start was reported denied; nothing may connect later
+                return
+            }
             doBindService()
         } ?: run {
             failManagedControlStart(vpnConfig)

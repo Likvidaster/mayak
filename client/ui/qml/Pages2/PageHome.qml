@@ -16,6 +16,14 @@ PageType {
     // Read-only selected-exit contract; empty or unmatched metadata is unknown.
     readonly property var exitLocation: typeof ConnectionController.exitLocation !== "undefined"
                                         ? ConnectionController.exitLocation : ({ candidateId: "", cityId: "" })
+    // Exit and method of the path being tried or connected: «Осло · AmneziaWG»; "" before an exit is chosen.
+    readonly property var route: typeof ConnectionController.route !== "undefined" ? ConnectionController.route : ({})
+    readonly property string routeMethod: route && typeof route.method === "string" ? route.method : ""
+    readonly property string routeText: routeMethod.length === 0 ? "" : (function() {
+        var city = typeof route.city === "string" && route.city.length > 0 ? route.city : CityData.cityName(route.cityId)
+        return (city.length > 0 ? city + " · " : "") + routeMethod
+    })()
+    readonly property string routeLine: routeText.length > 0 ? "\n" + routeText : ""
     property bool cityDetailsOpen: false
     property real detailsProgress: 0
     readonly property real detailsBodyOpacity: Math.max(0, 2 * detailsProgress - 1)
@@ -260,9 +268,10 @@ PageType {
             }
         }
         BodyTextType {
-            objectName: "mayak-connection-phase-status"; Layout.fillWidth: true; Layout.minimumHeight: 36
+            objectName: "mayak-connection-phase-status"; Layout.fillWidth: true; Layout.minimumHeight: 36; textFormat: Text.PlainText
             visible: !root.cityVisible && !connectButton.showUnknownCityCard && !root.cityDetailsOpen && !["Idle", "Connected"].includes(connectButton.archivePhase)
-            text: { switch (connectButton.archivePhase) { case "Fetching": return qsTr("Этап 1 из 4 · Получаем настройки"); case "Admitting": return qsTr("Этап 2 из 4 · Выбираем выход"); case "Starting": return qsTr("Этап 3 из 4 · Запускаем туннель"); case "Verifying": return qsTr("Этап 4 из 4 · Проверяем соединение"); case "Stopping": return qsTr("Отключаем…"); case "Cancelled": return qsTr("Подключение отменено"); case "Failed": return ConnectionController.connectionStateText; default: return ConnectionController.connectionStateText } }
+            // Mayak: while a path starts or is checked, the second line names the exit and the method.
+            text: { switch (connectButton.archivePhase) { case "Fetching": return qsTr("Этап 1 из 4 · Получаем настройки"); case "Admitting": return qsTr("Этап 2 из 4 · Выбираем выход"); case "Starting": return qsTr("Этап 3 из 4 · Запускаем туннель") + root.routeLine; case "Verifying": return qsTr("Этап 4 из 4 · Проверяем соединение") + root.routeLine; case "Stopping": return qsTr("Отключаем…"); case "Cancelled": return qsTr("Подключение отменено"); case "Failed": return ConnectionController.connectionStateText; default: return ConnectionController.connectionStateText } }
             horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; wrapMode: Text.WordWrap; color: AmneziaStyle.color.mayakInkMuted
         }
         BodyTextType { objectName: "mayak-long-wait-hint"; Layout.fillWidth: true; visible: root.waitingPhase !== "" && root.longWait && !root.cancelRequested; text: qsTr("Это занимает дольше обычного"); horizontalAlignment: Text.AlignHCenter; color: AmneziaStyle.color.mayakInkMuted }
@@ -318,7 +327,7 @@ PageType {
             Item { Layout.fillWidth: true; Layout.preferredHeight: 4
                 Rectangle { anchors.centerIn: parent; width: 36; height: 4; radius: 2; color: AmneziaStyle.mayakDay ? "#9A9FAB" : "#5E6880" }
             }
-            Text { text: "●  СОЕДИНЕНИЕ ПРОВЕРЕНО"; color: AmneziaStyle.semanticPalette.ok; font.family: AmneziaStyle.uiFontFamily; font.pixelSize: 14; font.weight: Font.DemiBold }
+            Text { objectName: "mayak-city-verified"; Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; text: "●  СОЕДИНЕНИЕ ПРОВЕРЕНО" + (root.routeMethod.length > 0 ? " · " + root.routeMethod : ""); color: AmneziaStyle.semanticPalette.ok; font.family: AmneziaStyle.uiFontFamily; font.pixelSize: 14; font.weight: Font.DemiBold }
             Text { id: cardTitle; objectName: "mayak-city-title"; Layout.fillWidth: true; text: root.cityTitle; textFormat: Text.PlainText; color: AmneziaStyle.color.mayakInk; font.family: AmneziaStyle.uiFontFamily; font.pixelSize: 25; font.weight: Font.DemiBold; wrapMode: Text.WordWrap }
             Text { objectName: "mayak-city-short"; Layout.fillWidth: true; visible: text.length > 0; text: root.cityShortText; textFormat: Text.PlainText; color: AmneziaStyle.color.mayakInkMuted; font.family: AmneziaStyle.uiFontFamily; font.pixelSize: 17; wrapMode: Text.WordWrap }
             RowLayout { Layout.fillWidth: true; spacing: 6

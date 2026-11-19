@@ -78,6 +78,8 @@ public:
     QString managedMessage() const;
     QString managedConnectionPhase() const;
     QVariantMap managedExitLocation() const;
+    // Mayak: the exit and method being tried or connected: {cityId, city, method}; empty otherwise.
+    QVariantMap managedRoute() const;
     bool managedCleanupPending() const;
     void retryManagedCleanup();
     bool canInstallUpdate() const;
