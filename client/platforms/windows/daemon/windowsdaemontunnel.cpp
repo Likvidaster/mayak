@@ -65,7 +65,15 @@ int WindowsDaemonTunnel::run(QStringList& tokens) {
     return 1;
   }
   auto name = WireguardUtilsWindows::s_interfaceName();
-  if (!tunnelProc(maybeConfig.utf16(), name.utf16())) {
+  const bool tunnelOk = tunnelProc(maybeConfig.utf16(), name.utf16());
+  // Mayak: tunnel.dll ran a service session (and may have created the Wintun adapter). Exiting at
+  // once broke the next connect until a reboot (Windows 5.1.0.25/5.1.0.26): the adapter teardown
+  // continues inside this process after tunnel.dll returns, and a cut teardown left the adapter's
+  // fixed GUID unusable (PnP code 31, 0xC00002F0). Keep the stopped process alive 20 s (verified on
+  // the owner's PC 20.11.2026: four reconnects without a reboot). Early failures above never ran
+  // tunnel.dll and still exit at once. The caller returns afterwards: never a second Mayak service.
+  Sleep(20000);
+  if (!tunnelOk) {
     logger.error() << "Failed to activate the tunnel service";
     return 1;
   }

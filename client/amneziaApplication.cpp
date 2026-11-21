@@ -43,7 +43,9 @@ AmneziaApplication::AmneziaApplication(int &argc, char *argv[]) : AMNEZIA_BASE_C
       m_optAutostart({QStringLiteral("a"), QStringLiteral("autostart")}, QStringLiteral("System autostart")),
       m_optCleanup  ({QStringLiteral("c"), QStringLiteral("cleanup")}, QStringLiteral("Cleanup logs")),
       m_optConnect  ({QStringLiteral("connect")}, QStringLiteral("Connect to server by index on startup"), QStringLiteral("index")),
-      m_optImport   ({QStringLiteral("import")}, QStringLiteral("Import configuration from data string"), QStringLiteral("data"))
+      m_optImport   ({QStringLiteral("import")}, QStringLiteral("Import configuration from data string"), QStringLiteral("data")),
+      m_optAfterUpdate({QStringLiteral("mayak-after-update")}, QStringLiteral("Started by the Mayak update guard")),
+      m_optReconnect({QStringLiteral("mayak-reconnect")}, QStringLiteral("Reconnect the VPN after the update"))
 {
     setDesktopFileName(QStringLiteral(APPLICATION_NAME));
     setQuitOnLastWindowClosed(false);
@@ -214,6 +216,13 @@ void AmneziaApplication::init()
     });
 #endif
 
+    if (m_parser.isSet(m_optAfterUpdate)) {
+        const bool reconnect = m_parser.isSet(m_optReconnect);
+        QTimer::singleShot(0, this, [this, reconnect]() {
+            if (m_coreController) m_coreController->mayakAfterUpdate(reconnect);
+        });
+    }
+
     if (m_parser.isSet(m_optConnect)) {
         bool ok = false;
         int idx = m_parser.value(m_optConnect).toInt(&ok);
@@ -276,6 +285,8 @@ bool AmneziaApplication::parseCommands()
     m_parser.addOption(m_optCleanup);
     m_parser.addOption(m_optConnect);
     m_parser.addOption(m_optImport);
+    m_parser.addOption(m_optAfterUpdate);
+    m_parser.addOption(m_optReconnect);
     
     m_parser.process(*this);
 

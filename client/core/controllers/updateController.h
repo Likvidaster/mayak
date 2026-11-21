@@ -11,6 +11,7 @@
 #include <functional>
 
 #include "core/repositories/secureAppSettingsRepository.h"
+#include "core/utils/signedUpdateManifest.h"
 
 class QCryptographicHash;
 class QNetworkAccessManager;
@@ -37,21 +38,6 @@ namespace UpdateState
     }
 }
 
-struct SignedUpdateManifest {
-    QString product;
-    QString channel;
-    QString platform;
-    QString version;
-    quint64 versionCode = 0;
-    QUrl url;
-    quint64 size = 0;
-    QByteArray sha256;
-    QDateTime publishedAt;
-    QDateTime expiresAt;
-    QString releaseNotes;
-};
-
-enum class SignedUpdateManifestDisposition { Newer, NoNewer };
 
 // Explicit dependencies make the real controller testable with loopback
 // transport, a generated fixture key and a non-executing installer callback.
@@ -68,6 +54,18 @@ struct UpdateControllerDependencies {
     std::function<QDateTime()> nowUtc;
     bool automaticChecksEnabled = true;
     bool checkOnConstruction = true;
+    // Mayak automatic update. Empty = production behaviour.
+    // unmeteredNetwork: Wi-Fi/Ethernet without a data limit (only then a package is downloaded by itself).
+    std::function<bool()> unmeteredNetwork;
+    // backgroundInstaller: hands the verified package to the platform's background install;
+    // 0 failed, 1 scheduled, 2 the platform first needs the user's permission.
+    std::function<int(const QString &path, const QByteArray &signedEnvelope)> backgroundInstaller;
+    // Android: the user allowed Mayak to install updates (checked before a ~140 MB download).
+    std::function<bool()> canInstallUpdates;
+    // systemDownloader (Android by default): the platform downloads the verified package in a system
+    // job on an unmetered network, checks size and SHA-256 and installs it (the app's own process is
+    // frozen in the background, 20.11.2026); 0 failed, 1 scheduled, 2 needs the user's permission.
+    std::function<int(const SignedUpdateManifest &)> systemDownloader;
 };
 
 class UpdateController : public QObject
@@ -92,6 +90,9 @@ public:
     bool isUpdateSupported() const;
     int getDownloadProgress() const;
     QString getStatusMessage() const;
+    bool isAutoUpdateEnabled() const;
+    void setAutoUpdateEnabled(bool enabled);
+    bool needsInstallPermission() const { return m_needsInstallPermission; }
     void setTunnelDisconnectedProvider(std::function<bool()> provider) { m_dependencies.tunnelDisconnected = std::move(provider); }
 
     // Without disposition, preserves legacy bool semantics: a valid but non-newer
@@ -118,6 +119,10 @@ signals:
     void updateCheckRunningChanged();
     void downloadProgressChanged();
     void statusMessageChanged();
+    void autoUpdateEnabledChanged();
+    void needsInstallPermissionChanged();
+    // Windows: a verified package waits for its background install (WindowsAutoUpdater).
+    void backgroundInstallReady(const QString &path, const QByteArray &signedEnvelope, const QString &version);
 
 private:
     enum class RequestKind { None, Manifest, Package };
@@ -136,6 +141,13 @@ private:
     void requestSignedManifest();
     void performUpdateCheck();
     void finishManifestRequest();
+    void maybeStartAutoUpdate();
+    void handOverToBackgroundInstall();
+    bool usesSystemDownload() const;
+    void handOverToSystemDownload();
+    void applyHandOverResult(int result);
+    bool isUnmeteredNetwork() const;
+    int runBackgroundInstaller(const QString &path);
     void beginPackageDownload();
     void consumePackageData();
     void finishPackageDownload();
@@ -167,6 +179,11 @@ private:
     quint64 m_downloadedBytes = 0;
     int m_downloadProgress = 0;
     QString m_statusMessage;
+    // Mayak automatic update: the running download was started by itself; the signed feed envelope of
+    // the verified update (the Windows service verifies it again before installing).
+    bool m_autoFlow = false;
+    bool m_needsInstallPermission = false;
+    QByteArray m_verifiedEnvelope;
     bool m_updateCheckRunning = false;
     bool m_updateSupported = false;
     bool m_signedFeedEnabled = false;

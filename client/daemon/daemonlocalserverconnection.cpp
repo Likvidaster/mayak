@@ -15,6 +15,8 @@
 
 #if defined(MZ_WINDOWS)
 #  include "platforms/windows/daemon/mayakforeignvpnstop.h"
+#  include "platforms/windows/daemon/mayakwintunheal.h"
+#  include "platforms/windows/daemon/mayakupdateapply.h"
 #endif
 
 namespace {
@@ -159,6 +161,33 @@ void DaemonLocalServerConnection::parseCommand(const QByteArray& data) {
     if (request.size() != 64) return;
     const QString result = Daemon::instance()->mayakPrepareSplitTunnel();
     write(QJsonObject{{"type", "mayakSplitTunnelPrepared"}, {"owner", "MayakVpnAwgLifecycleV1"},
+        {"requestId", request}, {"result", result}});
+    return;
+  }
+  // Mayak automatic update: install a verified newer Mayak in the background (the service verifies
+  // the signed feed envelope and the package itself; see mayakupdateapply.h).
+  if (type == "mayakApplyUpdate") {
+    const QString request = obj.value("requestId").toString();
+    if (request.size() != 64) return;
+    const QByteArray envelope = QByteArray::fromBase64(obj.value("envelope").toString().toLatin1());
+    const QString result = MayakUpdateApply::apply(envelope, obj.value("package").toString(), obj.value("vpnWasOn").toBool(),
+                                                   reinterpret_cast<void*>(m_socket->socketDescriptor()));
+    write(QJsonObject{{"type", "mayakUpdateApplying"}, {"owner", "MayakVpnAwgLifecycleV1"},
+        {"requestId", request}, {"result", result}});
+    return;
+  }
+  // Mayak automatic update: the new app reconnected; the update guard lifts its traffic block.
+  if (type == "mayakUpdateConnected") {
+    MayakUpdateApply::signalConnected();
+    return;
+  }
+  // Mayak: Windows refused to create Mayak's tunnel adapter on the last start; repair the WinTun
+  // state with one temporary adapter (never while Mayak's tunnel service runs).
+  if (type == "mayakHealWintun") {
+    const QString request = obj.value("requestId").toString();
+    if (request.size() != 64) return;
+    const QString result = MayakWintunHeal::run();
+    write(QJsonObject{{"type", "mayakWintunHealed"}, {"owner", "MayakVpnAwgLifecycleV1"},
         {"requestId", request}, {"result", result}});
     return;
   }

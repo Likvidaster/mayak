@@ -60,7 +60,8 @@ public:
 #else
         bool noHealthMeansLocalFailure = false;
 #endif
-        QList<qint64> localStartRetryMs { 30000, 60000, 120000, 240000, 300000 };
+        // The first retry repairs WinTun in the service first (see healWintunFirst), so it comes sooner.
+        QList<qint64> localStartRetryMs { 10000, 30000, 60000, 120000, 240000, 300000 };
         // The "proven" report after a passing tunnel probe. The first try keeps its short budget
         // (it never delays «Подключено»); a try that got no answer from the server (timeout,
         // network) is repeated in the background with these delays while the same attempt stays
@@ -68,15 +69,37 @@ public:
         qint64 provenReportMs = 2500;
         qint64 provenRetryBudgetMs = 8000;
         QList<qint64> provenRetryMs { 3000, 8000, 15000 };
+        // AWG quick give-up: no handshake this long after the path started ends the path before
+        // the full proof time. Android reports tunnel health only after a handshake; in the owner's
+        // logs (19-20.11.2026) the first health came 0.5-3.2 s after the start, and a dead exit
+        // used the full 6 s. Windows reports health as soon as its interface exists, and a new
+        // tunnel there passed TCP only 2.5-3.1 s after that: no short safe bound yet (0 = off).
+#ifdef Q_OS_ANDROID
+        qint64 awgNoHandshakeMs = 4000;
+#else
+        qint64 awgNoHandshakeMs = 0;
+#endif
+        // Parallel TCP check of every exit's Xray port before the exits are tried (no data sent).
+        qint64 portPrecheckMs = 1500;
     };
     static RecoveryTiming recoveryTiming();
     static void setRecoveryTimingForTests(const RecoveryTiming& timing);
     static void resetFailoverMemoryForTests();
     // Replaces the service's app-exclusion preparation (Windows) in tests; empty restores the default.
     static void setSplitPrepareForTests(std::function<void(QObject*, std::function<void(bool, QString)>)> hook);
+    // Replaces the service's WinTun repair (Windows) in tests (never the real service there).
+    static void setWintunHealForTests(std::function<void(QObject*, std::function<void(bool, QString)>)> hook);
     // Replaces the Android shutdown of the app's own HTTPS sockets in tests; empty restores the default.
     // startStale: whether connections may already be tied to a tunnel (a fresh process: true).
     static void setHttpsSocketResetForTests(std::function<int()> hook, bool startStale = false);
+    // Replaces the TCP check of the exits' Xray port in tests (never real addresses there);
+    // empty restores the real check. done(answered) lists one flag per host, in host order.
+    using PortPrecheck = std::function<void(QObject* context, const QStringList& hosts, quint16 port, int timeoutMs,
+                                            std::function<void(QList<bool>)> done)>;
+    static void setPortPrecheckForTests(PortPrecheck hook);
+    static PortPrecheck realPortPrecheckForTests(); // the real check, for loopback-only tests
+    // The exit memory's "same local network" check ("interface/subnet/prefix" entries; the tunnel by address).
+    static bool sameLocalNetworkForTests(const QStringList& before, const QStringList& now, const QString& tunnelAddress);
 signals:
     void stateChanged(Vpn::ConnectionState state, const QString& message);
 private:

@@ -99,6 +99,13 @@ public:
 
     bool isAutoUpdateCheckEnabled() const;
     void setAutoUpdateCheckEnabled(bool enabled);
+    // Mayak: download and install updates by themselves (default on, owner 20.11.2026).
+    bool isMayakAutoUpdateEnabled() const;
+    void setMayakAutoUpdateEnabled(bool enabled);
+    // The version whose background install was last handed to the system (and when).
+    QString mayakAutoUpdateScheduledVersion() const;
+    QDateTime mayakAutoUpdateScheduledAt() const;
+    void setMayakAutoUpdateScheduled(const QString &version, const QDateTime &at);
     bool isSaveLogs() const;
     void setSaveLogs(bool enabled);
     QDateTime getLogEnableDate() const;

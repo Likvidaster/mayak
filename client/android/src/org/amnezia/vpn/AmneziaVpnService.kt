@@ -35,6 +35,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -98,6 +99,8 @@ private const val HIDDEN_CONNECT_HEALTH_MS = 30_000L
 private const val WATCHDOG_FAILOVER_AFTER_ATTEMPTS = 2
 private const val WATCHDOG_FAILOVER_REPEAT_MS = 120_000L
 private const val DISCONNECT_TIMEOUT = 5000L
+// Mayak: a tunnel restarted after an app update must be up (AWG handshake) within this time.
+private const val RESUME_PROOF_MS = 30_000L
 private const val STOP_SERVICE_TIMEOUT = 5000L
 
 @SuppressLint("Registered")
@@ -146,6 +149,11 @@ open class AmneziaVpnService : VpnService() {
     private var managedStartedAt = 0L
     private var backendReplacedWhileHidden = false
     private var trafficStatsUpdateJob: Job? = null
+    // Mayak (update without losing the VPN): the managed tunnel being started, as it is restarted
+    // after an app update (no ticket/context), its heartbeat, and a pending resume's deadline.
+    private var resumeCandidateConfig: String? = null
+    private var resumeHeartbeatJob: Job? = null
+    private var resumeDeadlineJob: Job? = null
     private var awgHealthSendingJob: Job? = null
     // private var statisticsSendingJob: Job? = null
     private lateinit var networkState: NetworkState
@@ -295,7 +303,9 @@ open class AmneziaVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val isAlwaysOn = intent != null && intent.action == SERVICE_INTERFACE
 
-        if (isAlwaysOn) {
+        if (intent?.action == MayakResume.ACTION_RESUME_AFTER_UPDATE) {
+            resumeAfterUpdate()
+        } else if (isAlwaysOn) {
             Log.d(TAG, "Start service via Always-on")
             connect()
         } else if (intent?.getBooleanExtra(AFTER_PERMISSION_CHECK, false) == true) {
@@ -492,9 +502,11 @@ open class AmneziaVpnService : VpnService() {
                         // if (isActivityConnected) launchSendingStatistics()
                         launchTrafficStatsUpdate()
                         updateWatchdog()
+                        keepForResumeAfterUpdate()
                     }
 
                     DISCONNECTED -> {
+                        forgetResumeAfterUpdate()
                         networkState.unbindNetworkListener()
                         managedNetworkState.unbindNetworkListener()
                         stopTrafficStatsUpdateJob()
@@ -505,6 +517,7 @@ open class AmneziaVpnService : VpnService() {
                     }
 
                     DISCONNECTING -> {
+                        forgetResumeAfterUpdate()
                         networkState.unbindNetworkListener()
                         managedNetworkState.unbindNetworkListener()
                         stopTrafficStatsUpdateJob()
@@ -663,6 +676,79 @@ open class AmneziaVpnService : VpnService() {
         if (host.isBlank() || port <= 0) null else (if (host.contains(':')) "[$host]" else host) + ":" + port
     } catch (_: Exception) { null }
 
+    // ---------- Mayak: update without losing the VPN (see MayakResume) ----------
+    @MainThread
+    private fun keepForResumeAfterUpdate() {
+        val config = resumeCandidateConfig
+        // AWG: its handshake proves a restarted tunnel. Xray (owner 21.11: no traffic around the VPN
+        // after an update): the exit agent inside the tunnel proves it (MayakExitAgentCheck).
+        if (!managedRequired || config == null) return
+        val kind = MayakResume.kindOf(this)
+        MayakResume.saveConnected(this, kind, config)
+        resumeHeartbeatJob?.cancel()
+        resumeHeartbeatJob = mainScope.launch {
+            while (isActive) {
+                delay(MayakResume.HEARTBEAT_MS)
+                if (isConnected) MayakResume.heartbeat(this@AmneziaVpnService, kind)
+            }
+        }
+    }
+
+    @MainThread
+    private fun forgetResumeAfterUpdate() {
+        resumeHeartbeatJob?.cancel(); resumeHeartbeatJob = null
+        resumeDeadlineJob?.cancel(); resumeDeadlineJob = null
+        MayakResume.clear(this, MayakResume.kindOf(this))
+    }
+
+    /**
+     * Right after an app update (MayakUpdateReceiver): restart the tunnel that was CONNECTED when the
+     * update killed the processes, with its own one-off ticket. The app adopts it when it starts.
+     * A tunnel that does not come back (AWG: no handshake; Xray: no answer of the exit agent inside
+     * the tunnel) within RESUME_PROOF_MS is stopped again: never a dead VPN that blocks the internet.
+     */
+    @MainThread
+    private fun resumeAfterUpdate() {
+        val kind = MayakResume.kindOf(this)
+        val saved = MayakResume.takeConfig(this, kind)
+        val config = saved?.let { parseConfigToJson(it) }
+        if (config == null || !config.optBoolean("managedRequired") || prepare(applicationContext) != null) {
+            Log.i(TAG, "MayakNet event=update_resume_skipped config=${if (config == null) 0 else 1}")
+            MayakUpdateInstaller.notifyReconnect(this)
+            mainScope.launch { stopSelf() } // after onStartCommand has put it in the foreground
+            return
+        }
+        val ticket = config.optString("managedTicket").ifBlank { "resume:" + java.util.UUID.randomUUID() }
+        config.put("managedTicket", ticket)
+        Log.i(TAG, "MayakNet event=update_resume_start kind=$kind")
+        connectToVpn(config.toString())
+        resumeDeadlineJob?.cancel()
+        resumeDeadlineJob = mainScope.launch {
+            if (this@AmneziaVpnService is XrayService) {
+                // Ask the exit agent every few seconds until it answers or the proof time is over.
+                val until = android.os.SystemClock.elapsedRealtime() + RESUME_PROOF_MS
+                var up = false
+                delay(3_000L)
+                while (!up && android.os.SystemClock.elapsedRealtime() < until) {
+                    if (activeManagedTicket != ticket) return@launch // adopted or replaced meanwhile
+                    up = xrayInterfaceName() != null && withContext(Dispatchers.IO) {
+                        MayakExitAgentCheck.answers(applicationContext, XRAY_LOCAL_ADDRESS, 4_000)
+                    }
+                    if (!up) delay(3_000L)
+                }
+                if (activeManagedTicket != ticket) return@launch
+                Log.i(TAG, "MayakNet event=update_resume_result up=${if (up) 1 else 0} kind=xray")
+                if (!up) { disconnect(); MayakUpdateInstaller.notifyReconnect(this@AmneziaVpnService) }
+                return@launch
+            }
+            delay(RESUME_PROOF_MS)
+            if (activeManagedTicket != ticket) return@launch // adopted or replaced meanwhile
+            val up = (activeSession.protocol as? Wireguard)?.tunnelHealth?.value?.latestHandshakeEpochMs?.let { it > 0L } == true
+            Log.i(TAG, "MayakNet event=update_resume_result up=${if (up) 1 else 0}")
+            if (!up) { disconnect(); MayakUpdateInstaller.notifyReconnect(this@AmneziaVpnService) }
+        }
+    }
+
     private fun xrayInterfaceName(): String? = try {
         java.net.NetworkInterface.getNetworkInterfaces()?.toList()?.firstOrNull { ni ->
             ni.isUp && ni.inetAddresses.toList().any { it.hostAddress == XRAY_LOCAL_ADDRESS }
@@ -717,6 +803,11 @@ open class AmneziaVpnService : VpnService() {
         }
 
         val managedTicket = config.optString("managedTicket")
+        // The resume copy keeps the owner's ticket: the app adopts the restarted tunnel by it
+        // (device test 21.11: a fresh ticket was refused and the app reconnected from scratch).
+        resumeCandidateConfig = if (managedTicket.isNotBlank()) JSONObject(config.toString()).apply {
+            remove("healthContextId"); put("managedRequired", true)
+        }.toString() else null
         managedRequired = config.optBoolean("managedRequired") || managedTicket.isNotBlank()
         if (managedRequired && managedTicket.isBlank()) return // restored managed work has no live authority
         val ticket = managedTicket.ifBlank { "legacy:" + java.util.UUID.randomUUID() }
@@ -982,6 +1073,8 @@ open class AmneziaVpnService : VpnService() {
             return
         }
         backendReplacedWhileHidden = false
+        // The owner proves and watches the tunnel from now on.
+        resumeDeadlineJob?.cancel(); resumeDeadlineJob = null
         Log.i(TAG, "MayakNet event=adopt_handover")
         reply(true)
     }

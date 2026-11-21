@@ -76,6 +76,12 @@ if(APPLE AND NOT IOS)
 endif()
 
 
+# Mayak automatic update: test builds read and accept the test feed channel only (never for people).
+option(MAYAK_UPDATE_TEST_CHANNEL "Build against the Mayak test update feed" OFF)
+if(MAYAK_UPDATE_TEST_CHANNEL)
+    add_compile_definitions(MAYAK_UPDATE_TEST_CHANNEL=1)
+endif()
+
 add_subdirectory(client)
 
 if(NOT IOS AND NOT ANDROID AND NOT MACOS_NE)

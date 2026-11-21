@@ -78,6 +78,14 @@ public:
     void requestNotificationPermission();
     bool requestAuthentication();
     int installUpdateApk(const QString &path);
+    // Mayak automatic update: background install (0 failed, 1 scheduled, 2 install permission missing).
+    int scheduleBackgroundUpdate(const QString &path);
+    // A system job downloads (unmetered network), checks and installs the verified package.
+    int scheduleUpdateDownload(const QString &url, quint64 size, const QString &sha256, const QString &version);
+    void cancelBackgroundUpdate();
+    bool canInstallUpdates();
+    void openInstallPermissionSettings();
+    void openVpnSystemSettings();
     void sendTouch(float x, float y);
     bool isPlay();
     QJsonObject getSubscriptionPlans();

@@ -25,6 +25,15 @@ object Prefs {
             app.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
         }
 
+    // Mayak: a separate encrypted file (one per writer process: SharedPreferences are not safe to
+    // write from several processes). Null when encrypted storage is unavailable (no plaintext fallback).
+    fun secureFile(name: String): SharedPreferences? = try {
+        EncryptedSharedPreferences(app, "$name.secure", MasterKey(app))
+    } catch (e: Exception) {
+        Log.e(TAG, "Encrypted storage unavailable for $name")
+        null
+    }
+
     fun init(app: Application) {
         Log.v(TAG, "Init Prefs")
         this.app = app

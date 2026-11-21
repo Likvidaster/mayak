@@ -380,18 +380,34 @@ private slots:
         settings.clearSettings();
     }
 
-    void probeRejectsForeignPinnedEndpoint() {
-        QCOMPARE(MayakTunnelProbe::echoHosts(), QStringList({"httpbingo.org", "httpbin.org"}));
+    // 5.1.0.27: no third-party echo hosts. The probe asks the exit agent at a fixed reserved
+    // address; a request without the expected exit id or with a foreign nonce shape is refused.
+    void probeRequiresExitAgentRequest() {
+        QCOMPARE(MayakTunnelProbe::agentAddress(), QStringLiteral("198.51.100.1"));
         MayakTunnelProbe probe;
         QSignalSpy spy(&probe, &MayakTunnelProbe::finished);
         MayakTunnelProbeRequest r;
         r.attemptTag = "a"; r.nonce = "n"; r.interfaceName = "awg0";
-        r.localAddress = QHostAddress("10.8.1.2"); r.expectedEgressIpv4 = {"203.0.113.9"}; r.deadlineMs = 1000;
-        r.pinnedEndpoints = {{"evil.example", "203.0.113.10"}};
-        probe.start(r);
+        r.localAddress = QHostAddress("10.8.1.2"); r.deadlineMs = 1000;
+        probe.start(r); // no exit id
         QTRY_COMPARE_WITH_TIMEOUT(spy.count(), 1, 2000);
         QCOMPARE(spy.first().at(1).toBool(), false);
-        QCOMPARE(spy.first().at(3).toString(), QStringLiteral("invalid pinned endpoint"));
+        QCOMPARE(spy.first().at(3).toString(), QStringLiteral("invalid probe request"));
+        r.expectedExitId = "exit-a"; r.nonce = "bad nonce/../";
+        probe.start(r);
+        QTRY_COMPARE_WITH_TIMEOUT(spy.count(), 2, 2000);
+        QCOMPARE(spy.at(1).at(3).toString(), QStringLiteral("invalid probe request"));
+    }
+
+    void agentAddressIsRoutedThroughVpnInSiteModes() {
+        QJsonObject only{{"splitTunnelType", 1}, {"splitTunnelSites", QJsonArray{"10.0.0.0/8"}}};
+        const QList<ProbeEndpoint> agent{{"198.51.100.1", "198.51.100.1"}};
+        QCOMPARE(applyProbeRoutes(only, agent), agent);
+        QVERIFY(strings(only["splitTunnelSites"]).contains("198.51.100.1"));
+        QJsonObject except{{"splitTunnelType", 2}, {"splitTunnelSites", QJsonArray{"198.51.100.0/24", "8.8.8.8"}}};
+        applyProbeRoutes(except, agent);
+        QVERIFY(!strings(except["splitTunnelSites"]).contains("198.51.100.0/24"));
+        QVERIFY(strings(except["splitTunnelSites"]).contains("8.8.8.8"));
     }
 };
 

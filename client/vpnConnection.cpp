@@ -139,43 +139,18 @@ bool mayakDesktopAppList()
 #endif
 }
 
-// Resolves the probe's echo hosts to IPv4 (system DNS, before the new tunnel exists). Calls done
-// exactly once on the context's thread, with the endpoints interleaved by host.
+// Split tunneling (sites): the exit agent's reserved address must be inside the VPN routes
+// ("only listed") or outside the exclusions ("all except"). No DNS and no third-party host since
+// 5.1.0.27: the address is fixed. Calls done once, queued on the context's thread.
 void resolveMayakProbeEndpoints(QObject *context, int timeoutMs,
                                 std::function<void(QList<mayak::split::ProbeEndpoint>)> done)
 {
-    struct State {
-        QStringList hosts;
-        QHash<QString, QList<mayak::split::ProbeEndpoint>> byHost;
-        int pending = 0;
-        bool finished = false;
-        std::function<void(QList<mayak::split::ProbeEndpoint>)> done;
-    };
-    auto st = std::make_shared<State>();
-    st->hosts = MayakTunnelProbe::echoHosts();
-    st->pending = int(st->hosts.size());
-    st->done = std::move(done);
-    auto finish = [st] {
-        if (st->finished) return;
-        st->finished = true;
-        QList<mayak::split::ProbeEndpoint> out;
-        for (int i = 0; i < 2; ++i)
-            for (const auto &host : st->hosts)
-                if (st->byHost.value(host).size() > i) out.append(st->byHost.value(host).at(i));
-        qInfo().noquote() << QStringLiteral("MayakNet event=split_probe_resolve endpoints=%1").arg(out.size());
-        if (st->done) st->done(out);
-    };
-    if (st->pending == 0 || timeoutMs <= 0) { QTimer::singleShot(0, context, finish); return; }
-    QTimer::singleShot(timeoutMs, context, finish);
-    for (const auto &host : st->hosts) {
-        QHostInfo::lookupHost(host, context, [st, host, finish](const QHostInfo &info) {
-            if (st->finished) return;
-            for (const auto &address : info.addresses())
-                if (address.protocol() == QAbstractSocket::IPv4Protocol)
-                    st->byHost[host].append({host, address.toString()});
-            if (--st->pending == 0) finish();
-        });
-    }
+    Q_UNUSED(timeoutMs)
+    const QString agent = MayakTunnelProbe::agentAddress();
+    QTimer::singleShot(0, context, [done = std::move(done), agent] {
+        qInfo().noquote() << QStringLiteral("MayakNet event=split_probe_route endpoints=1");
+        if (done) done({{agent, agent}});
+    });
 }
 } // namespace
 
@@ -1191,9 +1166,8 @@ MayakBackendBridge::Port VpnConnection::managedBackendPort() {
         }
         auto* probe = new MayakTunnelProbe(self);
         s->probe = probe;
-        request.pinnedEndpoints = s->probeEndpoints;
-        // A managed proof is always bound to its interface with the exit's own egress.
-        request.socksPort = 0; request.acceptAnyPublicEgress = false;
+        // A managed proof is always bound to its tunnel interface and asks the exit agent.
+        request.socksPort = 0;
         request.deadlineMs = int(qMin<qint64>(request.deadlineMs,qMax<qint64>(0,deadline-B::monotonicMillis())));
         connect(probe,&MayakTunnelProbe::finished,self,[self,s,t,done,probe](quint64,bool ok,MayakTunnelProbeProof proof,QString error) {
             probe->deleteLater();

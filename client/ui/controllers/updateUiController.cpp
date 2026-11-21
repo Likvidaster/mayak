@@ -3,6 +3,10 @@
 #include <QDate>
 #include <QLocale>
 
+#if defined(Q_OS_ANDROID)
+#include "platforms/android/android_controller.h"
+#endif
+
 UpdateUiController::UpdateUiController(UpdateController* updateController, QObject *parent)
     : QObject(parent), m_updateController(updateController)
 {
@@ -16,7 +20,38 @@ UpdateUiController::UpdateUiController(UpdateController* updateController, QObje
         connect(m_updateController, &UpdateController::updateCheckRunningChanged, this, &UpdateUiController::isCheckRunningChanged);
         connect(m_updateController, &UpdateController::downloadProgressChanged, this, &UpdateUiController::downloadProgressChanged);
         connect(m_updateController, &UpdateController::statusMessageChanged, this, &UpdateUiController::statusMessageChanged);
+        connect(m_updateController, &UpdateController::autoUpdateEnabledChanged, this, &UpdateUiController::autoUpdateEnabledChanged);
+        connect(m_updateController, &UpdateController::needsInstallPermissionChanged, this, &UpdateUiController::needsInstallPermissionChanged);
     }
+}
+
+bool UpdateUiController::autoUpdateEnabled() const
+{
+    return m_updateController && m_updateController->isAutoUpdateEnabled();
+}
+
+void UpdateUiController::setAutoUpdateEnabled(bool enabled)
+{
+    if (m_updateController) m_updateController->setAutoUpdateEnabled(enabled);
+}
+
+bool UpdateUiController::needsInstallPermission() const
+{
+    return m_updateController && m_updateController->needsInstallPermission();
+}
+
+void UpdateUiController::openInstallPermissionSettings()
+{
+#if defined(Q_OS_ANDROID)
+    AndroidController::instance()->openInstallPermissionSettings();
+#endif
+}
+
+void UpdateUiController::openVpnSystemSettings()
+{
+#if defined(Q_OS_ANDROID)
+    AndroidController::instance()->openVpnSystemSettings();
+#endif
 }
 
 QString UpdateUiController::getVersion() const

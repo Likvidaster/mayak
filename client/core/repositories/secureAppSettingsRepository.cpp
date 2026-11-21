@@ -495,6 +495,32 @@ void SecureAppSettingsRepository::setAutoUpdateCheckEnabled(bool enabled)
     setValue("Conf/autoUpdateCheck", enabled);
 }
 
+bool SecureAppSettingsRepository::isMayakAutoUpdateEnabled() const
+{
+    return value("Conf/mayakAutoUpdate", true).toBool();
+}
+
+void SecureAppSettingsRepository::setMayakAutoUpdateEnabled(bool enabled)
+{
+    setValue("Conf/mayakAutoUpdate", enabled);
+}
+
+QString SecureAppSettingsRepository::mayakAutoUpdateScheduledVersion() const
+{
+    return value("Conf/mayakAutoUpdateScheduledVersion").toString();
+}
+
+QDateTime SecureAppSettingsRepository::mayakAutoUpdateScheduledAt() const
+{
+    return value("Conf/mayakAutoUpdateScheduledAt").toDateTime();
+}
+
+void SecureAppSettingsRepository::setMayakAutoUpdateScheduled(const QString &version, const QDateTime &at)
+{
+    setValue("Conf/mayakAutoUpdateScheduledVersion", version);
+    setValue("Conf/mayakAutoUpdateScheduledAt", at);
+}
+
 bool SecureAppSettingsRepository::isSaveLogs() const
 {
     return value("Conf/saveLogs", false).toBool();

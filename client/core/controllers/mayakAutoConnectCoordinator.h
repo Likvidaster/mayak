@@ -84,6 +84,9 @@ struct OwnTunnelProof {
     std::string pathId;
     bool interfaceBound = false;
     Millis probeStartedAt = 0;
+    // Xray path (5.1.0.27, no third-party sites): the exit agent answered inside this tunnel with
+    // this exit's id and the nonce. Only our exit can answer inside its own Reality tunnel.
+    std::string observedExitId;
 };
 struct ProofResult { bool probeSucceeded = false; OwnTunnelProof evidence; };
 struct StopResult { bool confirmedDisconnected = false; };

@@ -199,6 +199,49 @@ int AndroidController::installUpdateApk(const QString &path)
     return pending.isCanceled() || pending.resultCount() == 0 ? UpdateInstallFailed : pending.result().toInt();
 }
 
+int AndroidController::scheduleBackgroundUpdate(const QString &path)
+{
+    auto pending = QNativeInterface::QAndroidApplication::runOnAndroidMainThread([path]() -> QVariant {
+        return static_cast<int>(callActivityMethod<jint>("scheduleBackgroundUpdate", "(Ljava/lang/String;)I",
+                        QJniObject::fromString(path).object<jstring>()));
+    }, QDeadlineTimer(5000));
+    pending.waitForFinished();
+    return pending.isCanceled() || pending.resultCount() == 0 ? 0 : pending.result().toInt();
+}
+
+int AndroidController::scheduleUpdateDownload(const QString &url, quint64 size, const QString &sha256, const QString &version)
+{
+    auto pending = QNativeInterface::QAndroidApplication::runOnAndroidMainThread([url, size, sha256, version]() -> QVariant {
+        return static_cast<int>(callActivityMethod<jint>("scheduleUpdateDownload",
+                        "(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)I",
+                        QJniObject::fromString(url).object<jstring>(), static_cast<jlong>(size),
+                        QJniObject::fromString(sha256).object<jstring>(),
+                        QJniObject::fromString(version).object<jstring>()));
+    }, QDeadlineTimer(5000));
+    pending.waitForFinished();
+    return pending.isCanceled() || pending.resultCount() == 0 ? 0 : pending.result().toInt();
+}
+
+bool AndroidController::canInstallUpdates()
+{
+    return callActivityMethod<jboolean>("canInstallUpdates", "()Z");
+}
+
+void AndroidController::cancelBackgroundUpdate()
+{
+    callActivityMethod("cancelBackgroundUpdate", "()V");
+}
+
+void AndroidController::openInstallPermissionSettings()
+{
+    callActivityMethod("openInstallPermissionSettings", "()V");
+}
+
+void AndroidController::openVpnSystemSettings()
+{
+    callActivityMethod("openVpnSystemSettings", "()V");
+}
+
 void AndroidController::resetLastServer(int serverIndex)
 {
     callActivityMethod("resetLastServer", "(I)V", serverIndex);

@@ -180,6 +180,32 @@ private slots:
         QVERIFY(result.isEmpty());
     }
 
+    void healWintunRequestAndReply() {
+        const QString id(64, QLatin1Char('c'));
+        const auto line = healWintunRequestLine(id);
+        QVERIFY(line.endsWith('\n'));
+        const auto obj = QJsonDocument::fromJson(line).object();
+        QCOMPARE(obj.value("type").toString(), QStringLiteral("mayakHealWintun"));
+        QCOMPARE(obj.value("requestId").toString(), id);
+        const auto answer = [](const QString& type, const QString& owner, const QString& req, const QString& result) {
+            return QJsonDocument(QJsonObject{{"type", type}, {"owner", owner}, {"requestId", req},
+                                             {"result", result}}).toJson(QJsonDocument::Compact);
+        };
+        const QString type = QStringLiteral("mayakWintunHealed");
+        QString result;
+        for (const char* r : {"healed", "busy", "no_wintun", "create_failed"}) {
+            QVERIFY(parseHealWintunReply(answer(type, kOwner, id, QString::fromLatin1(r)), id, &result));
+            QCOMPARE(result, QString::fromLatin1(r));
+        }
+        result.clear();
+        QVERIFY(!parseHealWintunReply(answer(type, kOwner, id, QStringLiteral("ok")), id, &result));
+        QVERIFY(!parseHealWintunReply(answer(type, kOwner, QString(64, QLatin1Char('d')), QStringLiteral("healed")), id, &result));
+        QVERIFY(!parseHealWintunReply(answer(type, QStringLiteral("x"), id, QStringLiteral("healed")), id, &result));
+        QVERIFY(!parseHealWintunReply(answer(QStringLiteral("mayakSplitTunnelPrepared"), kOwner, id, QStringLiteral("healed")), id, &result));
+        QVERIFY(!parseHealWintunReply("not json", id, &result));
+        QVERIFY(result.isEmpty());
+    }
+
 #ifdef Q_OS_WINDOWS
     void serviceEndsOnlyBrowsecsCoreByPath() {
         using MayakForeignVpnStop::isKnownCore;

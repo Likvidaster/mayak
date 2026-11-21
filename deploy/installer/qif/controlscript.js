@@ -4,6 +4,14 @@ var desktopAppProcessRunning = false;
 var appInstalledUninstallerPath;
 var appInstalledUninstallerPath_x86;
 
+// Mayak automatic update (5.1.0.27): the service's update guard runs this full installer without a
+// window ("MayakSilent=1", as SYSTEM in session 0). The pages then advance by themselves and
+// every message box of this installer gets its automatic answer; the normal wizard is unchanged.
+function mayakSilent()
+{
+    return runningOnWindows() && installer.value("MayakSilent") === "1";
+}
+
 function appName()
 {
     return installer.value("Name");
@@ -126,6 +134,7 @@ function requestToQuit(installer,gui)
 
 Controller.prototype.PerformInstallationPageCallback = function()
 {
+    if (mayakSilent()) return; // advanced by installationFinished (see Controller)
     if (runningOnWindows()) return;
     gui.clickButton(buttons.NextButton);
 }
@@ -137,6 +146,10 @@ Controller.prototype.LicenseAgreementPageCallback = function()
 
 Controller.prototype.FinishedPageCallback = function ()
 {
+    if (mayakSilent()) {
+        gui.clickButton(buttons.FinishButton);
+        return;
+    }
     if (desktopAppProcessRunning) {
         gui.clickButton(buttons.FinishButton);
     } else if (installer.isUpdater()) {
@@ -163,6 +176,10 @@ Controller.prototype.ComponentSelectionPageCallback = function()
 
 Controller.prototype.ReadyForInstallationPageCallback = function()
 {
+    if (mayakSilent()) {
+        gui.clickButton(buttons.CommitButton);
+        return;
+    }
     if (installer.isUpdater()) {
         gui.clickButton(buttons.CommitButton);
     }
@@ -183,6 +200,10 @@ Controller.prototype.TargetDirectoryPageCallback = function ()
 Controller.prototype.IntroductionPageCallback = function ()
 {
     var widget = gui.currentPageWidget();
+    if (mayakSilent() && installer.isInstaller()) {
+        gui.clickButton(buttons.NextButton);
+        return;
+    }
     if (installer.isUpdater() && updaterCompleted === 1) {
         gui.clickButton(buttons.FinishButton);
         gui.clickButton(buttons.CancelButton);
@@ -241,6 +262,23 @@ function Controller () {
 
     if (runningOnWindows()) {
         installer.setValue("AllUsers", "true");
+    }
+    if (mayakSilent()) {
+        // Nobody can answer: every box of this installer is answered automatically (errors -> cancel,
+        // which rolls back), and the finished installation moves on to the last page by itself.
+        installer.autoRejectMessageBoxes(); // any box without its own answer below: No/Cancel (rolls back)
+        installer.setMessageBoxAutomaticAnswer("Mayak VPN", QMessageBox.Ok);
+        installer.setMessageBoxAutomaticAnswer("os.information", QMessageBox.Ok);
+        installer.setMessageBoxAutomaticAnswer("OverwriteTargetDirectory", QMessageBox.Yes);
+        installer.setMessageBoxAutomaticAnswer("cancelInstallation", QMessageBox.Yes);
+        installer.setMessageBoxAutomaticAnswer("installationError", QMessageBox.Ok);
+        installer.setMessageBoxAutomaticAnswer("installationErrorWithRetry", QMessageBox.Cancel);
+        installer.setMessageBoxAutomaticAnswer("installationErrorWithCancel", QMessageBox.Cancel);
+        installer.setMessageBoxAutomaticAnswer("DownloadError", QMessageBox.Cancel);
+        installer.setMessageBoxAutomaticAnswer("ArchiveDownloadError", QMessageBox.Cancel);
+        installer.installationFinished.connect(function() {
+            gui.clickButton(buttons.NextButton);
+        });
     }
 
     if (installer.isInstaller()) {

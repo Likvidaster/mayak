@@ -144,6 +144,9 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/windowstunnelservice.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/wireguardutilswindows.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/mayakforeignvpnstop.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/mayakwintunheal.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/mayakupdateapply.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../client/core/utils/signedUpdateManifest.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/windowstunnellogger.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/windowsroutemonitor.h
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/windowsutils.h
@@ -166,6 +169,9 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/windowstunnelservice.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/wireguardutilswindows.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/mayakforeignvpnstop.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/mayakwintunheal.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/mayakupdateapply.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../client/core/utils/signedUpdateManifest.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/windowstunnellogger.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/daemon/windowsroutemonitor.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/windowspingsender.cpp
@@ -482,6 +488,24 @@ if (WIN32)
         DESTINATION ${CMAKE_INSTALL_BINDIR}
         COMPONENT AmneziaVPN
     )
+endif()
+
+# Mayak automatic update: the service verifies update feeds with the same embedded key as the app.
+if(WIN32)
+    qt_add_resources(${PROJECT} "mayak_update_signing_key"
+        PREFIX "/mayak"
+        BASE ${CMAKE_SOURCE_DIR}/mayak
+        FILES ${CMAKE_SOURCE_DIR}/mayak/update_signing_public.pem)
+endif()
+
+# Mayak update guard (Windows): plain Win32, static runtime, no Qt. The service copies it next to a
+# verified update package and starts it as SYSTEM (see mayakupdateguard.cpp).
+if(WIN32)
+    add_executable(MayakUpdateGuard ${CMAKE_CURRENT_SOURCE_DIR}/../../client/platforms/windows/updateguard/mayakupdateguard.cpp)
+    set_property(TARGET MayakUpdateGuard PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    target_compile_definitions(MayakUpdateGuard PRIVATE UNICODE _UNICODE)
+    target_link_libraries(MayakUpdateGuard PRIVATE fwpuclnt wtsapi32 userenv advapi32 rpcrt4)
+    install(TARGETS MayakUpdateGuard DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT AmneziaVPN)
 endif()
 
 # install target

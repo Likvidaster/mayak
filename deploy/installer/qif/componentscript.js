@@ -173,6 +173,34 @@ function StopForReplacement {
   }
   WaitStopped
 }
+function StopTunnelGently {
+  # Mayak 5.1.0.27: stop the running VPN tunnel through Windows first and give it time to remove its
+  # WinTun adapter. A tunnel cut while files were replaced left the adapter unusable until a reboot
+  # (owner's PC, 20.11.2026). Never throws and never kills anything: the old steps follow as before.
+  try {
+    $tunnel='MayakWGTunnel$MayakVPN'
+    $t=Get-Service -Name $tunnel -ErrorAction SilentlyContinue
+    if ($t -and $t.Status -ne 'Stopped') {
+      try {Stop-Service -Name $tunnel -NoWait -ErrorAction Stop} catch {}
+      $until=[DateTime]::UtcNow.AddSeconds(15)
+      do {$t=Get-Service -Name $tunnel -ErrorAction SilentlyContinue; if (-not $t -or $t.Status -eq 'Stopped') {break}; Start-Sleep -Milliseconds 250} while ([DateTime]::UtcNow -lt $until)
+    }
+  } catch {}
+}
+function WaitServiceProcesses {
+  # Since 5.1.0.27 the tunnel process stays ~20 s after its tunnel stopped (adapter teardown). Wait
+  # for this installation's service processes to end by themselves (bounded); only paths are read.
+  try {
+    $until=[DateTime]::UtcNow.AddSeconds(30)
+    do {
+      $left=@(Get-CimInstance Win32_Process -Filter "Name='MayakVPN-service.exe'" -ErrorAction Stop | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+        [string]::Equals([IO.Path]::GetFullPath([string]$_.ExecutablePath),$expected,[StringComparison]::OrdinalIgnoreCase) })
+      if ($left.Count -eq 0) {break}
+      Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $until)
+  } catch {}
+}
 function WaitStopped {
   for ($poll=0; $poll -lt 120; $poll++) {
     # A missing result is not proof that SCM stopped the service. Query errors
@@ -235,7 +263,7 @@ try {
         throw
       }
     }
-    if ($null -ne $s) {StopForReplacement}
+    if ($null -ne $s) {StopTunnelGently; StopForReplacement; WaitServiceProcesses}
     $preflightSnapshot|ConvertTo-Json -Compress
   }
   'finish' {

@@ -324,20 +324,22 @@ void Coordinator::onStart(CycleId c, AttemptId a, StartResult r) {
 
 bool Coordinator::proofMatches(const OwnTunnelProof& p, const std::string& nonce,
                                const Candidate& candidate, Millis started, Millis now) {
-    return p.certificateValid && p.nonceMatched && p.nonce == nonce && !nonce.empty() &&
-           p.peerHandshakeObserved && !p.ownPeerId.empty() && !p.counterReset &&
+    // AWG (5.1.0.27, no third-party sites): the tunnel proves itself. A handshake answered with
+    // this device's own peer keys (only our exit holds the server key) after this start, and data
+    // received from that peer. No network request leaves the device for the proof.
+    (void)nonce; (void)candidate;
+    return p.peerHandshakeObserved && !p.ownPeerId.empty() && !p.counterReset &&
            p.rxBytesAfter > p.rxBytesBefore && p.handshakeAt <= now &&
-           (p.handshakeAt >= started || (p.adoptedLiveSession && now - p.handshakeAt <= 180000)) &&
-           std::find(candidate.expectedEgressIps.begin(), candidate.expectedEgressIps.end(), p.observedEgressIp) != candidate.expectedEgressIps.end();
+           (p.handshakeAt >= started || (p.adoptedLiveSession && now - p.handshakeAt <= 180000));
 }
 bool Coordinator::xrayProofMatches(const OwnTunnelProof& p, const std::string& nonce, const Candidate& candidate,
                                    const std::string& pathId, Millis pathStarted, Millis now) {
-    // No peer telemetry exists for Xray: only the probe through this path's own tunnel
-    // interface, started after this path started, proves it (nonce, TLS, expected egress).
-    return p.certificateValid && p.nonceMatched && p.nonce == nonce && !nonce.empty() &&
+    // No peer telemetry exists for Xray: only the exit agent's answer through this path's own
+    // tunnel interface, started after this path started, proves it (nonce, this exit's id).
+    return p.nonceMatched && p.nonce == nonce && !nonce.empty() &&
            !pathId.empty() && p.pathId == pathId && p.interfaceBound &&
            p.probeStartedAt >= pathStarted && p.probeStartedAt <= now && !p.peerHandshakeObserved &&
-           std::find(candidate.expectedEgressIps.begin(), candidate.expectedEgressIps.end(), p.observedEgressIp) != candidate.expectedEgressIps.end();
+           !candidate.id.empty() && p.observedExitId == candidate.id;
 }
 void Coordinator::onProof(CycleId c, AttemptId a, ProofResult p) {
     if (!current(c, a) || status_.state != State::Verifying) return;

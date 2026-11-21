@@ -351,24 +351,12 @@ void ConnectionController::probeLegacyXray(quint64 generation, int attempt)
         emit closeConnectionRequested(); // never leave an unproven tunnel looking like VPN
     };
     if (name.isEmpty()) { retryOrFail(); return; }
-    auto *probe = new MayakTunnelProbe(this);
-    MayakTunnelProbeRequest request;
-    request.attemptTag = QStringLiteral("legacy-xray-%1").arg(generation);
-    request.localAddress = QHostAddress(local);
-    request.interfaceName = name;
-    request.acceptAnyPublicEgress = true; // the user's own server: its egress is not known
-    request.nonce = QUuid::createUuid().toString(QUuid::Id128);
-    request.deadlineMs = 8000;
-    connect(probe, &MayakTunnelProbe::finished, this, [this, probe, generation, retryOrFail](quint64, bool ok, MayakTunnelProbeProof, QString) {
-        probe->deleteLater();
-        if (generation != m_legacyXrayGeneration) return;
-        if (!ok) { retryOrFail(); return; }
-        qInfo().noquote() << "MayakNet event=legacy_xray_proven";
-        m_legacyXrayProven = true;
-        m_effectiveState = Vpn::ConnectionState::Connected;
-        emit connectionStateChanged(m_effectiveState);
-    });
-    probe->start(request);
+    // 5.1.0.27 (owner: no third-party sites at all): the user's own server has no Mayak exit agent,
+    // so its tunnel counts as up once its own Xray interface exists with the tunnel address.
+    qInfo().noquote() << "MayakNet event=legacy_xray_proven by=interface";
+    m_legacyXrayProven = true;
+    m_effectiveState = Vpn::ConnectionState::Connected;
+    emit connectionStateChanged(m_effectiveState);
 }
 
 void ConnectionController::closeConnection()

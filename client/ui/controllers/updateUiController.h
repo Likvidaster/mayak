@@ -22,6 +22,8 @@ class UpdateUiController : public QObject
     Q_PROPERTY(int downloadProgress READ downloadProgress NOTIFY downloadProgressChanged)
     Q_PROPERTY(QString statusMessage READ statusMessage NOTIFY statusMessageChanged)
     Q_PROPERTY(bool isUpdateSupported READ isUpdateSupported CONSTANT)
+    Q_PROPERTY(bool autoUpdateEnabled READ autoUpdateEnabled WRITE setAutoUpdateEnabled NOTIFY autoUpdateEnabledChanged)
+    Q_PROPERTY(bool needsInstallPermission READ needsInstallPermission NOTIFY needsInstallPermissionChanged)
 
 public:
     explicit UpdateUiController(UpdateController* updateController, QObject *parent = nullptr);
@@ -39,6 +41,9 @@ public:
     int downloadProgress() const;
     QString statusMessage() const;
     bool isUpdateSupported() const;
+    bool autoUpdateEnabled() const;
+    void setAutoUpdateEnabled(bool enabled);
+    bool needsInstallPermission() const;
 
 public slots:
     void checkForUpdates();
@@ -46,6 +51,9 @@ public slots:
     void install();
     void retry();
     void cancel();
+    // Android: the "install unknown apps" page of Mayak; Android's VPN page ("Block connections without VPN").
+    void openInstallPermissionSettings();
+    void openVpnSystemSettings();
 
 signals:
     void updateMetadataChanged();
@@ -57,6 +65,8 @@ signals:
     void isCheckRunningChanged();
     void downloadProgressChanged();
     void statusMessageChanged();
+    void autoUpdateEnabledChanged();
+    void needsInstallPermissionChanged();
 
 private:
     UpdateController* m_updateController;

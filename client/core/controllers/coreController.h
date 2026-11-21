@@ -105,6 +105,8 @@ public:
     PageController* pageController() const;
     void setQmlRoot();
     void checkForAppUpdates();
+    // Mayak automatic update (Windows): the app was restarted by the update guard.
+    void mayakAfterUpdate(bool reconnect);
 
     void openConnectionByIndex(int serverIndex);
     void importConfigFromData(const QString &data);

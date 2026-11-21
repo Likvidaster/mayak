@@ -268,6 +268,128 @@ void requestPrepareSplitTunnel(QObject* ctx, std::function<void(bool, QString)> 
 #endif
 }
 
+QByteArray healWintunRequestLine(const QString& requestId) {
+    return QJsonDocument(QJsonObject{{QStringLiteral("type"), QStringLiteral("mayakHealWintun")},
+                                     {QStringLiteral("requestId"), requestId}}).toJson(QJsonDocument::Compact) + '\n';
+}
+
+bool parseHealWintunReply(const QByteArray& line, const QString& requestId, QString* result) {
+    const auto obj = QJsonDocument::fromJson(line.trimmed()).object();
+    if (obj.value(QStringLiteral("type")).toString() != QStringLiteral("mayakWintunHealed")) return false;
+    if (obj.value(QStringLiteral("owner")).toString() != QLatin1String(kOwner)) return false;
+    if (requestId.isEmpty() || obj.value(QStringLiteral("requestId")).toString() != requestId) return false;
+    static const QStringList known{QStringLiteral("healed"), QStringLiteral("busy"), QStringLiteral("no_wintun"),
+                                   QStringLiteral("create_failed")};
+    const QString value = obj.value(QStringLiteral("result")).toString();
+    if (!known.contains(value)) return false;
+    if (result) *result = value;
+    return true;
+}
+
+void requestHealWintun(QObject* ctx, std::function<void(bool, QString)> done, int timeoutMs) {
+#ifndef Q_OS_WINDOWS
+    QTimer::singleShot(0, ctx, [done] { done(false, QString()); });
+    Q_UNUSED(timeoutMs);
+    return;
+#else
+    QByteArray raw(32, Qt::Uninitialized);
+    QRandomGenerator::system()->generate(reinterpret_cast<quint32*>(raw.data()),
+                                         reinterpret_cast<quint32*>(raw.data() + raw.size()));
+    const QString id = QString::fromLatin1(raw.toHex());
+    auto* socket = new QLocalSocket(ctx);
+    auto* timer = new QTimer(socket);
+    timer->setSingleShot(true);
+    auto finished = std::make_shared<bool>(false);
+    auto buffer = std::make_shared<QByteArray>();
+    // Settles once; the socket is closed and deleted later, never inside its own signal.
+    auto finish = [ctx, socket, done, finished](bool replied, QString result) {
+        if (*finished) return;
+        *finished = true;
+        QObject::disconnect(socket, nullptr, nullptr, nullptr);
+        QTimer::singleShot(0, ctx, [socket, done, replied, result] {
+            socket->abort();
+            socket->deleteLater();
+            done(replied, result);
+        });
+    };
+    QObject::connect(socket, &QLocalSocket::connected, socket, [socket, id] {
+        socket->write(healWintunRequestLine(id));
+        socket->flush();
+    });
+    QObject::connect(socket, &QLocalSocket::readyRead, socket, [socket, buffer, id, finish] {
+        buffer->append(socket->readAll());
+        for (qsizetype pos; (pos = buffer->indexOf('\n')) >= 0;) {
+            const QByteArray line = buffer->left(pos);
+            buffer->remove(0, pos + 1);
+            QString result;
+            if (parseHealWintunReply(line, id, &result)) { finish(true, result); return; }
+        }
+        if (buffer->size() > 64 * 1024) finish(false, {});
+    });
+    QObject::connect(socket, &QLocalSocket::errorOccurred, socket, [finish] { finish(false, {}); });
+    QObject::connect(timer, &QTimer::timeout, socket, [finish] { finish(false, {}); });
+    timer->start(timeoutMs);
+    socket->connectToServer(QLatin1String(kDaemonPipe));
+#endif
+}
+
+void requestApplyUpdate(QObject* ctx, const QByteArray& signedEnvelope, const QString& packagePath, bool vpnWasOn,
+                        std::function<void(bool, QString)> done, int timeoutMs) {
+#ifndef Q_OS_WINDOWS
+    Q_UNUSED(signedEnvelope); Q_UNUSED(packagePath); Q_UNUSED(vpnWasOn); Q_UNUSED(timeoutMs);
+    QTimer::singleShot(0, ctx, [done] { done(false, QString()); });
+#else
+    QByteArray raw(32, Qt::Uninitialized);
+    QRandomGenerator::system()->generate(reinterpret_cast<quint32*>(raw.data()),
+                                         reinterpret_cast<quint32*>(raw.data() + raw.size()));
+    const QString id = QString::fromLatin1(raw.toHex());
+    const QByteArray line = QJsonDocument(QJsonObject{{QStringLiteral("type"), QStringLiteral("mayakApplyUpdate")},
+        {QStringLiteral("requestId"), id}, {QStringLiteral("envelope"), QString::fromLatin1(signedEnvelope.toBase64())},
+        {QStringLiteral("package"), packagePath}, {QStringLiteral("vpnWasOn"), vpnWasOn}}).toJson(QJsonDocument::Compact) + '\n';
+    auto* socket = new QLocalSocket(ctx);
+    auto* timer = new QTimer(socket);
+    timer->setSingleShot(true);
+    auto finished = std::make_shared<bool>(false);
+    auto buffer = std::make_shared<QByteArray>();
+    auto finish = [ctx, socket, done, finished](bool replied, QString result) {
+        if (*finished) return;
+        *finished = true;
+        QObject::disconnect(socket, nullptr, nullptr, nullptr);
+        QTimer::singleShot(0, ctx, [socket, done, replied, result] { socket->abort(); socket->deleteLater(); done(replied, result); });
+    };
+    QObject::connect(socket, &QLocalSocket::connected, socket, [socket, line] { socket->write(line); socket->flush(); });
+    QObject::connect(socket, &QLocalSocket::readyRead, socket, [socket, buffer, id, finish] {
+        buffer->append(socket->readAll());
+        for (qsizetype pos; (pos = buffer->indexOf('\n')) >= 0;) {
+            const auto obj = QJsonDocument::fromJson(buffer->left(pos).trimmed()).object();
+            buffer->remove(0, pos + 1);
+            if (obj.value(QStringLiteral("type")).toString() == QStringLiteral("mayakUpdateApplying") &&
+                obj.value(QStringLiteral("owner")).toString() == QLatin1String(kOwner) &&
+                obj.value(QStringLiteral("requestId")).toString() == id) {
+                finish(true, obj.value(QStringLiteral("result")).toString());
+                return;
+            }
+        }
+        if (buffer->size() > 64 * 1024) finish(false, {});
+    });
+    QObject::connect(socket, &QLocalSocket::errorOccurred, socket, [finish] { finish(false, {}); });
+    QObject::connect(timer, &QTimer::timeout, socket, [finish] { finish(false, {}); });
+    timer->start(timeoutMs);
+    socket->connectToServer(QLatin1String(kDaemonPipe));
+#endif
+}
+
+void notifyUpdateConnected() {
+#ifdef Q_OS_WINDOWS
+    QLocalSocket socket;
+    socket.connectToServer(QLatin1String(kDaemonPipe));
+    if (!socket.waitForConnected(2000)) return;
+    socket.write(QJsonDocument(QJsonObject{{QStringLiteral("type"), QStringLiteral("mayakUpdateConnected")}}).toJson(QJsonDocument::Compact) + '\n');
+    socket.flush();
+    socket.waitForBytesWritten(2000);
+#endif
+}
+
 int stopXrayLeftoverBlocking(int timeoutMs) {
 #ifndef Q_OS_WINDOWS
     Q_UNUSED(timeoutMs);

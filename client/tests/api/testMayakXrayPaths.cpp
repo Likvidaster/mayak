@@ -61,10 +61,12 @@ struct FakeAdapter : ac::Adapter {
     std::function<bool(const ac::Path&)> works = [](const ac::Path&) { return true; };
     int releases = 0, proven = 0, stops = 0;
     std::string candidateEgress = "81.29.149.103";
+    std::string exitId; // the exit agent answers with this id (5.1.0.27)
     void fetchFresh(ac::CycleId c, ac::AttemptId a, ac::Millis, FetchDone done) override {
         log.push_back("fetch");
         ac::Snapshot s; s.schemaVersion = 1; s.revision = "1"; s.expiresAt = clock->now() + 3600000;
-        s.candidates.push_back({guid().toStdString(), "81.29.149.103", 49963, true, {candidateEgress}});
+        exitId = guid().toStdString();
+        s.candidates.push_back({exitId, "81.29.149.103", 49963, true, {candidateEgress}});
         done(c, a, ac::FetchStatus::Success, s);
     }
     void acquire(ac::CycleId c, ac::AttemptId a, const ac::Candidate&, ac::Millis, AdmissionDone done) override {
@@ -84,7 +86,7 @@ struct FakeAdapter : ac::Adapter {
         if (!works(path)) { done(c, a, r); return; }
         r.probeSucceeded = true;
         auto& e = r.evidence;
-        e.certificateValid = true; e.nonceMatched = true; e.nonce = nonce; e.observedEgressIp = candidateEgress;
+        e.nonceMatched = true; e.nonce = nonce; e.observedExitId = exitId;
         if (path.kind == ac::PathKind::Awg) {
             e.ownPeerId = "peer"; e.handshakeAt = clock->now(); e.rxBytesBefore = 1; e.rxBytesAfter = 2; e.peerHandshakeObserved = true;
         } else {
@@ -247,7 +249,7 @@ private slots:
     }
     void xrayProofNeedsItsOwnInterfaceProbeAfterThePathStarted() {
         const ac::Candidate cand{"c", "81.29.149.103", 443, true, {"81.29.149.103"}};
-        ac::OwnTunnelProof p; p.certificateValid = true; p.nonceMatched = true; p.nonce = "n"; p.observedEgressIp = "81.29.149.103";
+        ac::OwnTunnelProof p; p.nonceMatched = true; p.nonce = "n"; p.observedExitId = "c";
         p.pathId = "xray-firefox"; p.interfaceBound = true; p.probeStartedAt = 100;
         QVERIFY(ac::Coordinator::xrayProofMatches(p, "n", cand, "xray-firefox", 100, 200));
         QVERIFY(!ac::Coordinator::xrayProofMatches(p, "n", cand, "xray-safari", 100, 200));   // another path
@@ -255,13 +257,41 @@ private slots:
         QVERIFY(!ac::Coordinator::xrayProofMatches(p, "m", cand, "xray-firefox", 100, 200));  // nonce
         auto q = p; q.interfaceBound = false;
         QVERIFY(!ac::Coordinator::xrayProofMatches(q, "n", cand, "xray-firefox", 100, 200));
-        q = p; q.observedEgressIp = "1.1.1.1";
+        q = p; q.observedExitId = "another-exit"; // the answer came from another exit
         QVERIFY(!ac::Coordinator::xrayProofMatches(q, "n", cand, "xray-firefox", 100, 200));
-        q = p; q.certificateValid = false;
+        q = p; q.observedExitId.clear();
         QVERIFY(!ac::Coordinator::xrayProofMatches(q, "n", cand, "xray-firefox", 100, 200));
         // An Xray proof can never stand in for an AWG proof (no peer telemetry).
         QVERIFY(!ac::Coordinator::proofMatches(p, "n", cand, 100, 200));
     }
+    // 5.1.0.27 (review R17 V-3): the AWG proof is the tunnel itself, no network request. Each of
+    // its conditions is required.
+    void awgProofNeedsAFreshHandshakeOfOurPeerAndData() {
+        const ac::Candidate cand{"c", "81.29.149.103", 443, true, {"81.29.149.103"}};
+        ac::OwnTunnelProof p; p.peerHandshakeObserved = true; p.ownPeerId = "peer";
+        p.handshakeAt = 150; p.rxBytesBefore = 0; p.rxBytesAfter = 148;
+        QVERIFY(ac::Coordinator::proofMatches(p, "n", cand, 100, 200));
+        auto q = p; q.handshakeAt = 99;                 // a handshake from before this start
+        QVERIFY(!ac::Coordinator::proofMatches(q, "n", cand, 100, 200));
+        q = p; q.handshakeAt = 201;                     // a handshake from the future
+        QVERIFY(!ac::Coordinator::proofMatches(q, "n", cand, 100, 200));
+        q = p; q.rxBytesAfter = 0;                      // nothing received from the peer
+        QVERIFY(!ac::Coordinator::proofMatches(q, "n", cand, 100, 200));
+        q = p; q.counterReset = true;                   // counters reset under the proof
+        QVERIFY(!ac::Coordinator::proofMatches(q, "n", cand, 100, 200));
+        q = p; q.ownPeerId.clear();                     // not our own peer
+        QVERIFY(!ac::Coordinator::proofMatches(q, "n", cand, 100, 200));
+        q = p; q.peerHandshakeObserved = false;         // no handshake at all
+        QVERIFY(!ac::Coordinator::proofMatches(q, "n", cand, 100, 200));
+        // An adopted live session: its handshake may predate the attempt, at most 180 s.
+        q = p; q.adoptedLiveSession = true; q.handshakeAt = 50;
+        QVERIFY(ac::Coordinator::proofMatches(q, "n", cand, 100, 200));
+        q.handshakeAt = 200 - 180001;
+        QVERIFY(!ac::Coordinator::proofMatches(q, "n", cand, 100, 200));
+        // An AWG proof can never stand in for an Xray proof (no exit agent answer).
+        QVERIFY(!ac::Coordinator::xrayProofMatches(p, "n", cand, "xray-firefox", 100, 200));
+    }
+
     void cancelDuringRaceReleasesWithoutStartingATunnel() {
         ManualClock clock; FakeAdapter f; f.clock = &clock; f.paths = {xp("firefox"), xp("safari")};
         ac::Adapter::RaceDone held;

@@ -12,6 +12,7 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
+#include <QUuid>
 #include <cstring>
 
 #include <openssl/evp.h>
@@ -19,6 +20,8 @@
 
 #include "core/controllers/updateController.h"
 #include "ui/controllers/updateUiController.h"
+#include "core/repositories/secureAppSettingsRepository.h"
+#include "secureQSettings.h"
 
 namespace
 {
@@ -293,6 +296,177 @@ private slots:
         controller.installUpdate();
         QCOMPARE(installerCalls, 1);
         QVERIFY(QFileInfo::exists(installedPath));
+        EVP_PKEY_free(signing.privateKey);
+    }
+
+    // Mayak automatic update (5.1.0.27): a newer verified update is downloaded by itself only on an
+    // unmetered network and handed to the background install once (with its signed envelope); the
+    // same version is not downloaded again within 24 h; the user's "off" stops it.
+    void automaticUpdateDownloadsOnUnmeteredAndHandsOverOnce()
+    {
+        SigningFixture signing = makeSigningFixture();
+        QVERIFY(signing.privateKey);
+        QTemporaryDir cache(QDir::currentPath() + QStringLiteral("/update-auto-XXXXXX"));
+        QVERIFY(cache.isValid());
+        FixtureNetwork network;
+        network.package = QByteArray("fixture installer bytes");
+        network.manifest = makeEnvelope(signing.privateKey, network.package);
+        SecureQSettings settings(QStringLiteral("MayakUpdateAuto-") + QUuid::createUuid().toString(QUuid::WithoutBraces),
+                                 QStringLiteral("test"), nullptr, true);
+        SecureAppSettingsRepository app(&settings);
+        bool unmetered = false;
+        int handed = 0, result = 1, launched = 0;
+        QString handedPath;
+        QByteArray handedEnvelope;
+        UpdateControllerDependencies dependencies;
+        dependencies.networkAccessManager = &network;
+        dependencies.signingPublicKeyPem = signing.publicPem;
+        dependencies.manifestUrl = QUrl(QStringLiteral("https://mayaklight.ru/updates/stable/windows-x64.json"));
+        dependencies.platform = QStringLiteral("windows-x64");
+        dependencies.installedVersion = QStringLiteral("5.1.0.4");
+        dependencies.installedVersionCode = 2186;
+        dependencies.cacheDirectory = cache.path();
+        dependencies.tunnelDisconnected = [] { return false; };
+        dependencies.installerLauncher = [&](const QString &) { ++launched; return true; };
+        dependencies.unmeteredNetwork = [&] { return unmetered; };
+        dependencies.backgroundInstaller = [&](const QString &path, const QByteArray &envelope) {
+            ++handed; handedPath = path; handedEnvelope = envelope; return result; };
+        dependencies.automaticChecksEnabled = false;
+        dependencies.checkOnConstruction = false;
+        UpdateController controller(&app, dependencies);
+        QVERIFY(controller.isAutoUpdateEnabled()); // on by default
+        QSignalSpy foundSpy(&controller, &UpdateController::updateFound);
+
+        controller.checkForUpdates(); // metered: found, not downloaded
+        QTRY_COMPARE_WITH_TIMEOUT(foundSpy.count(), 1, 2000);
+        QTest::qWait(200);
+        QCOMPARE(controller.getUpdateState(), UpdateState::State::Idle);
+        QCOMPARE(handed, 0);
+
+        unmetered = true;
+        controller.checkForUpdates();
+        QTRY_COMPARE_WITH_TIMEOUT(handed, 1, 3000);
+        QCOMPARE(controller.getUpdateState(), UpdateState::State::ReadyToInstall);
+        QVERIFY(QFileInfo::exists(handedPath));
+        QCOMPARE(handedEnvelope, network.manifest);
+        QCOMPARE(launched, 0); // never the interactive installer
+        QCOMPARE(app.mayakAutoUpdateScheduledVersion(), QStringLiteral("5.1.0.5"));
+        QVERIFY(!controller.needsInstallPermission());
+
+        controller.checkForUpdates(); // the same version within 24 h: nothing again
+        QTRY_COMPARE_WITH_TIMEOUT(foundSpy.count(), 3, 2000);
+        QTest::qWait(300);
+        QCOMPARE(handed, 1);
+        QVERIFY(controller.getStatusMessage().contains(QStringLiteral("установится сама")));
+        settings.clearSettings();
+        EVP_PKEY_free(signing.privateKey);
+    }
+
+    void automaticUpdateOffOrPermissionMissing()
+    {
+        SigningFixture signing = makeSigningFixture();
+        QVERIFY(signing.privateKey);
+        QTemporaryDir cache(QDir::currentPath() + QStringLiteral("/update-auto-XXXXXX"));
+        QVERIFY(cache.isValid());
+        FixtureNetwork network;
+        network.package = QByteArray("fixture installer bytes");
+        network.manifest = makeEnvelope(signing.privateKey, network.package);
+        SecureQSettings settings(QStringLiteral("MayakUpdateAuto-") + QUuid::createUuid().toString(QUuid::WithoutBraces),
+                                 QStringLiteral("test"), nullptr, true);
+        SecureAppSettingsRepository app(&settings);
+        app.setMayakAutoUpdateEnabled(false);
+        int handed = 0;
+        UpdateControllerDependencies dependencies;
+        dependencies.networkAccessManager = &network;
+        dependencies.signingPublicKeyPem = signing.publicPem;
+        dependencies.manifestUrl = QUrl(QStringLiteral("https://mayaklight.ru/updates/stable/windows-x64.json"));
+        dependencies.platform = QStringLiteral("windows-x64");
+        dependencies.installedVersion = QStringLiteral("5.1.0.4");
+        dependencies.installedVersionCode = 2186;
+        dependencies.cacheDirectory = cache.path();
+        dependencies.unmeteredNetwork = [] { return true; };
+        dependencies.backgroundInstaller = [&](const QString &, const QByteArray &) { ++handed; return 2; };
+        dependencies.automaticChecksEnabled = false;
+        dependencies.checkOnConstruction = false;
+        UpdateController controller(&app, dependencies);
+        QSignalSpy foundSpy(&controller, &UpdateController::updateFound);
+        controller.checkForUpdates(); // off: found, nothing downloaded
+        QTRY_COMPARE_WITH_TIMEOUT(foundSpy.count(), 1, 2000);
+        QTest::qWait(200);
+        QCOMPARE(controller.getUpdateState(), UpdateState::State::Idle);
+        QCOMPARE(handed, 0);
+
+        controller.setAutoUpdateEnabled(true); // turning it on starts at once
+        QTRY_COMPARE_WITH_TIMEOUT(handed, 1, 3000);
+        QVERIFY(controller.needsInstallPermission());
+        QVERIFY(app.mayakAutoUpdateScheduledVersion().isEmpty()); // not handed over: retried later
+        settings.clearSettings();
+        EVP_PKEY_free(signing.privateKey);
+    }
+
+    // Android (device test 20.11.2026: the app's process is frozen in the background, a download inside
+    // it never finished): the verified update goes to the system download job; the app downloads
+    // nothing itself, does not use its own unmetered check, and does not hand it over again in 24 h.
+    void automaticUpdateHandsOverToSystemDownload()
+    {
+        SigningFixture signing = makeSigningFixture();
+        QVERIFY(signing.privateKey);
+        QTemporaryDir cache(QDir::currentPath() + QStringLiteral("/update-auto-XXXXXX"));
+        QVERIFY(cache.isValid());
+        FixtureNetwork network;
+        network.package = QByteArray("fixture installer bytes");
+        network.manifest = makeEnvelope(signing.privateKey, network.package);
+        SecureQSettings settings(QStringLiteral("MayakUpdateAuto-") + QUuid::createUuid().toString(QUuid::WithoutBraces),
+                                 QStringLiteral("test"), nullptr, true);
+        SecureAppSettingsRepository app(&settings);
+        int system = 0, installer = 0, result = 0;
+        SignedUpdateManifest handed;
+        UpdateControllerDependencies dependencies;
+        dependencies.networkAccessManager = &network;
+        dependencies.signingPublicKeyPem = signing.publicPem;
+        dependencies.manifestUrl = QUrl(QStringLiteral("https://mayaklight.ru/updates/stable/windows-x64.json"));
+        dependencies.platform = QStringLiteral("windows-x64");
+        dependencies.installedVersion = QStringLiteral("5.1.0.4");
+        dependencies.installedVersionCode = 2186;
+        dependencies.cacheDirectory = cache.path();
+        dependencies.unmeteredNetwork = [] { return false; }; // the job waits for the network itself
+        dependencies.backgroundInstaller = [&](const QString &, const QByteArray &) { ++installer; return 1; };
+        dependencies.systemDownloader = [&](const SignedUpdateManifest &update) { ++system; handed = update; return result; };
+        dependencies.automaticChecksEnabled = false;
+        dependencies.checkOnConstruction = false;
+        UpdateController controller(&app, dependencies);
+        QSignalSpy foundSpy(&controller, &UpdateController::updateFound);
+
+        controller.checkForUpdates(); // the job could not be scheduled: marked, retried after 24 h
+        QTRY_COMPARE_WITH_TIMEOUT(system, 1, 3000);
+        QCOMPARE(app.mayakAutoUpdateScheduledVersion(), QStringLiteral("!5.1.0.5"));
+        app.setMayakAutoUpdateScheduled(QString(), QDateTime());
+
+        result = 1;
+        controller.checkForUpdates();
+        QTRY_COMPARE_WITH_TIMEOUT(system, 2, 3000);
+        QCOMPARE(handed.version, QStringLiteral("5.1.0.5"));
+        QCOMPARE(handed.size, quint64(network.package.size()));
+        QCOMPARE(handed.sha256, QCryptographicHash::hash(network.package, QCryptographicHash::Sha256).toHex());
+        QCOMPARE(handed.url.scheme(), QStringLiteral("https"));
+        QCOMPARE(network.packageRequests, 0); // nothing downloaded by the app
+        QCOMPARE(installer, 0);
+        QCOMPARE(controller.getUpdateState(), UpdateState::State::Idle);
+        QCOMPARE(app.mayakAutoUpdateScheduledVersion(), QStringLiteral("5.1.0.5"));
+        QVERIFY(controller.getStatusMessage().contains(QStringLiteral("установится сама")));
+
+        controller.checkForUpdates(); // the same version within 24 h: nothing again
+        QTRY_COMPARE_WITH_TIMEOUT(foundSpy.count(), 3, 2000);
+        QTest::qWait(200);
+        QCOMPARE(system, 2);
+
+        result = 2; // permission taken back: asks, nothing marked
+        app.setMayakAutoUpdateScheduled(QString(), QDateTime());
+        controller.checkForUpdates();
+        QTRY_COMPARE_WITH_TIMEOUT(system, 3, 3000);
+        QVERIFY(controller.needsInstallPermission());
+        QVERIFY(app.mayakAutoUpdateScheduledVersion().isEmpty());
+        settings.clearSettings();
         EVP_PKEY_free(signing.privateKey);
     }
 

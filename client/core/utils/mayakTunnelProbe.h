@@ -9,16 +9,17 @@
 
 #include "core/utils/mayakSplitTunneling.h"
 
+// 5.1.0.27 (owner's decision, variant В): no third-party sites. The probe asks the exit agent
+// inside the Xray tunnel: plain HTTP to a reserved address that only our exit's Xray routes to
+// its local agent; the answer carries the nonce and the exit's id. Nothing leaves the exit.
 struct MayakTunnelProbeRequest {
     QString attemptTag;
     QHostAddress localAddress;
     QString interfaceName;
-    QStringList expectedEgressIpv4;
+    // Id of the exit (gateway candidate id) that must answer inside this tunnel.
+    QString expectedExitId;
     QString nonce;
     int deadlineMs = 8000;
-    // Split tunneling (sites): endpoints routed through the VPN. When set, the probe connects
-    // only to these IPv4 addresses; TLS still verifies the certificate for the host name.
-    QList<mayak::split::ProbeEndpoint> pinnedEndpoints;
     // Xray path race (no tunnel exists yet): connect through this local SOCKS5 entry of the
     // race engine instead of binding to a tunnel interface. Never a tunnel proof by itself:
     // the proof of a started path always binds to its tunnel interface.
@@ -26,9 +27,6 @@ struct MayakTunnelProbeRequest {
     QString socksUser;
     QString socksPassword;
     bool viaSocks() const { return socksPort != 0; }
-    // Manually imported configs only: the egress is unknown, so any public IPv4 is accepted
-    // (TLS + nonce through the bound interface still required). Never for a Mayak server.
-    bool acceptAnyPublicEgress = false;
 #ifdef MAYAK_TUNNEL_PROBE_TESTING
     QString testHost;
     quint16 testPort = 0;
@@ -43,10 +41,9 @@ struct MayakTunnelProbeRequest {
 struct MayakTunnelProbeProof {
     QString attemptTag;
     QString nonce;
-    QString observedEgressIpv4;
+    QString observedExitId;
     QString interfaceName;
     QString localAddress;
-    bool certificateVerified = false;
 };
 
 class MayakTunnelProbe final : public QObject {
@@ -56,13 +53,14 @@ public:
     quint64 start(const MayakTunnelProbeRequest &request);
     void cancel();
 
-    // Strict response validator also used by deterministic tests.
-    static bool validateResponse(const QByteArray &body, const QString &nonce,
-                                 const QStringList &expectedEgressIpv4,
-                                 QString *observedEgressIpv4, QString *error);
+    // Strict agent answer validator also used by deterministic tests:
+    // exactly {"v":1,"exit":"<expected>","nonce":"<nonce>"}.
+    static bool validateAgentResponse(const QByteArray &body, const QString &nonce,
+                                      const QString &expectedExitId, QString *observedExitId, QString *error);
     static bool parseHttpResponse(const QByteArray &wire, QByteArray *body, QString *error);
-    // HTTPS echo hosts the probe uses (resolved by the owner for split tunneling routes).
-    static QStringList echoHosts();
+    // Reserved IPv4 of the exit agent (always routed through the tunnel, also in split mode).
+    static QString agentAddress();
+    static quint16 agentPort();
 
 signals:
     void finished(quint64 generation, bool success, const MayakTunnelProbeProof &proof,

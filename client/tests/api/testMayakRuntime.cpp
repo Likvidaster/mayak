@@ -11,12 +11,14 @@
 #include <QImage>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QPointer>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
 #include <QUuid>
 #include "core/utils/mayakTunnelProbe.h"
 #include "core/controllers/mayakAutoConnectRuntime.h"
+#include "version.h"
 #include "core/controllers/mayakAutoConnectCoordinator.h"
 #include "core/controllers/mayakAttemptStore.h"
 #include "core/controllers/connectionController.h"
@@ -83,6 +85,78 @@ struct TinyHttp : QObject {
     }
     QString base() const { return QStringLiteral("http://127.0.0.1:%1/gw/").arg(server.serverPort()); }
 };
+// Minimal local SOCKS5 entry (user/password) that answers as the exit agent itself and closes,
+// like Xray + agent in the path race (device test 21.11, 5.1.0.37 crash). Never the real network.
+struct TinySocksAgent : QObject {
+    QTcpServer server;
+    QString exitId;
+    bool holdOpen=false; // like Xray's uplinkOnly: the client side stays open after the answer
+    QByteArray trailing;  // bytes after the declared body (must never become a proof)
+    int splitDelayMs=0;   // > 0: headers+half body first, the rest after this delay
+    QByteArray lengthHeader="Content-Length"; // spelling of the length header ("" = no length)
+    bool wrongNonce=false;
+    explicit TinySocksAgent(QString exit) : exitId(std::move(exit)) {
+        server.listen(QHostAddress::LocalHost,0);
+        connect(&server,&QTcpServer::newConnection,this,[this] {
+            while (QTcpSocket* socket=server.nextPendingConnection()) {
+                connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
+                connect(socket,&QTcpSocket::readyRead,socket,[this,socket] { serve(socket); });
+            }
+        });
+    }
+    void serve(QTcpSocket* socket) {
+        QByteArray in=socket->property("in").toByteArray()+socket->readAll();
+        int stage=socket->property("stage").toInt();
+        for (;;) {
+            if (stage==0) { // greeting: 05 n methods...
+                if (in.size()<2 || in.size()<2+quint8(in[1])) break;
+                in.remove(0,2+quint8(in[1])); socket->write(QByteArray("\x05\x02",2)); stage=1; continue;
+            }
+            if (stage==1) { // RFC 1929: 01 ulen user plen pass
+                if (in.size()<2) break;
+                const int ulen=quint8(in[1]); if (in.size()<3+ulen) break;
+                const int plen=quint8(in[2+ulen]); if (in.size()<3+ulen+plen) break;
+                in.remove(0,3+ulen+plen); socket->write(QByteArray("\x01\x00",2)); stage=2; continue;
+            }
+            if (stage==2) { // 05 01 00 atyp addr port
+                if (in.size()<5) break;
+                const int atyp=quint8(in[3]);
+                const int need=atyp==1?10:atyp==4?22:atyp==3?7+quint8(in[4]):-1;
+                if (need<0) { socket->abort(); return; }
+                if (in.size()<need) break;
+                in.remove(0,need); socket->write(QByteArray("\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00",10)); stage=3; continue;
+            }
+            if (stage==3) { // GET /mayak-proof?n=<nonce> HTTP/1.1 ... \r\n\r\n
+                const int end=in.indexOf("\r\n\r\n"); if (end<0) break;
+                const QByteArray line=in.left(in.indexOf("\r\n"));
+                const int at=line.indexOf("?n="); const int sp=line.indexOf(' ',at);
+                const QByteArray nonce=at<0||sp<0?QByteArray():line.mid(at+3,sp-at-3);
+                const QByteArray answered=wrongNonce?QByteArray("0123456789abcdef0123456789abcdef"):nonce;
+                const QByteArray body="{\"v\":1,\"exit\":\""+exitId.toUtf8()+"\",\"nonce\":\""+answered+"\"}";
+                const QByteArray head="HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    +(lengthHeader.isEmpty()?QByteArray():lengthHeader+": "+QByteArray::number(body.size())+"\r\n")
+                    +"Connection: close\r\n\r\n";
+                const QByteArray all=head+body+trailing;
+                if (splitDelayMs>0) {
+                    const qsizetype cut=head.size()+body.size()/2;
+                    socket->write(all.left(cut)); socket->flush();
+                    QPointer<QTcpSocket> guard(socket);
+                    QTimer::singleShot(splitDelayMs,socket,[this,guard,rest=all.mid(cut)] {
+                        if (!guard) return;
+                        guard->write(rest); guard->flush();
+                        if (!holdOpen) guard->disconnectFromHost();
+                    });
+                } else {
+                    socket->write(all);
+                    if (!holdOpen) socket->disconnectFromHost();
+                }
+                stage=4;
+            }
+            break;
+        }
+        socket->setProperty("in",in); socket->setProperty("stage",stage);
+    }
+};
 QString photoPath(const QString& ext=QStringLiteral("png")) {
     return QStringLiteral("media/servers/0123456789abcdef0123456789abcdef.")+ext+QStringLiteral("?v=0123456789ab");
 }
@@ -113,6 +187,7 @@ struct World : QObject {
     QList<QJsonObject> requestPayloads;
     QList<std::shared_ptr<QPromise<GatewayPostResult>>> heldTransportPromises, allTransportPromises;
     AwgTunnelHealth health;
+    QTimer traffic; B::Ticket awgTicket; bool xrayActive=false; bool stallRx=false; bool idle=false; bool healthGone=false;
     std::function<void(B::Ticket,AwgTunnelHealth)> observeHealth;
     B::Done startDone;
     QString permissionRequestId;
@@ -135,6 +210,14 @@ struct World : QObject {
     std::function<void(bool)> observeVisibility;
     std::function<void(B::Ticket)> observeFailover;
     bool silentFirst=false, singleCandidate=false;
+    QString silentHost;      // AWG on this exit host never answers a handshake (no valid health)
+    QString xrayDeadHost;    // Xray on this exit host never comes up
+    // Port precheck fixture (never real addresses): hosts listed here do not answer.
+    QSet<QString> tcpDeadHosts; int prechecks=0; quint16 precheckPort=0;
+    QStringList startHosts;  // "<host>/<protocol>" per backend start
+    // WinTun repair fixture (never the real service): counts requests; holdHeal keeps the reply.
+    int heals=0; bool holdHeal=false; std::function<void(bool,QString)> heldHeal;
+    QString healResult=QStringLiteral("healed");
     // Xray paths (5.1.0.21): acquire offers them when asked; the fixture backend runs either path.
     bool offerXray=false, awgSilent=false, xrayDead=false;
     int awgStarts=0, xrayStarts=0;
@@ -150,6 +233,11 @@ struct World : QObject {
     // attempt is not confirmed in time (a later stop is).
     bool localFailStopUnconfirmed=false;
     QSet<QString> localFailTickets, localFailStopsSeen;
+    // Candidate of the n-th acquire (0-based) of this World.
+    QString acquireCandidate(int n) const {
+        for (const auto& p:requestPayloads) if (p.value("action").toString()=="acquire" && n--==0) return p.value("candidate_id").toString();
+        return {};
+    }
     QString lastAcquireCandidate() const {
         QString id;
         for (const auto& p:requestPayloads) if (p.value("action").toString()=="acquire") id=p.value("candidate_id").toString();
@@ -159,6 +247,20 @@ struct World : QObject {
     Vpn::ConnectionState state=Vpn::ConnectionState::Disconnected;
     explicit World(bool withRecover=false, bool withAdopt=true) {
         MayakAutoConnectRuntime::resetFailoverMemoryForTests(); // process-wide failover memory
+        MayakAutoConnectRuntime::setPortPrecheckForTests([this](QObject*,const QStringList& hosts,quint16 port,int,
+                                                               std::function<void(QList<bool>)> done) {
+            ++prechecks; precheckPort=port;
+            QList<bool> answered; for (const auto& host:hosts) answered<<!tcpDeadHosts.contains(host);
+            done(answered);
+        });
+        MayakAutoConnectRuntime::setWintunHealForTests([this](QObject* ctx,std::function<void(bool,QString)> done) {
+            ++heals; events<<"heal";
+            if (holdHeal) { heldHeal=done; return; }
+            const QString result=healResult;
+            QTimer::singleShot(0,ctx,[done,result] { done(true,result); });
+        });
+        // This app version already ran here: no "first connect of a new version" repair in tests.
+        settings.setValue("Mayak/wintunHealVersion",QStringLiteral(APP_VERSION));
         ApiV2ServerConfig cfg;
         cfg.configVersion=serverConfigUtils::ConfigSource::AmneziaGateway;
         cfg.name="Mayak test"; cfg.defaultContainer=DockerContainer::Awg;
@@ -188,16 +290,19 @@ struct World : QObject {
         port.start=[this](B::Ticket ticket,QString,QJsonObject config,qint64,B::Done done) {
             ++starts; events<<"start"; current=ticket;
             const QString protocol=config.value("protocol").toString();
-            startedProtocols<<protocol;
+            startedProtocols<<protocol; startHosts<<selectedHost+"/"+protocol;
             if (protocol=="xray") {
                 ++xrayStarts; lastXrayConfig=config; ticket.gate->commit(); backendRunning=true;
+                xrayActive=true; awgTicket={};
                 AwgHealthContext expected{"xray:"+ticket.opaqueAttempt,"78726179",selectedHost+":443"};
                 done({ticket,B::Outcome::Started,expected});
-                health={expected.id,1,expected.peerPublicKey,expected.endpoint,"10.33.0.2/32","MayakXrayFixture",0,10,10,!xrayDead};
+                health={expected.id,1,expected.peerPublicKey,expected.endpoint,"10.33.0.2/32","MayakXrayFixture",0,10,10,
+                        !xrayDead && selectedHost!=xrayDeadHost};
                 QTimer::singleShot(10,this,[this,ticket] {if(observeHealth)observeHealth(ticket,health);});
                 return;
             }
             ++awgStarts;
+            xrayActive=false;
             if (appExclusionFails) mayak::split::markAppExclusionFailure();
             if(holdStart) { startDone=done; return; }
             ticket.gate->commit(); backendRunning=true;
@@ -206,8 +311,11 @@ struct World : QObject {
             // localFailStarts: started, but the tunnel interface never comes up (no health at all).
             if (localFailStarts>0) { --localFailStarts; events<<"local_fail"; localFailTickets.insert(ticket.opaqueAttempt); return; }
             // silentFirst: the first exit never answers a handshake (no valid health ever).
-            const bool silent=(silentFirst && selectedHost=="81.29.149.103") || awgSilent;
-            health={expected.id,1,expected.peerPublicKey,expected.endpoint,"10.8.0.2","MayakFixture",quint64(QDateTime::currentMSecsSinceEpoch()),10,10,!silent};
+            const bool silent=(silentFirst && selectedHost=="81.29.149.103") || awgSilent || selectedHost==silentHost;
+            // badProof (5.1.0.27, AWG proof = handshake + RX): the exit never answers a handshake.
+            health={expected.id,1,expected.peerPublicKey,expected.endpoint,"10.8.0.2","MayakFixture",
+                    badProof ? 0 : quint64(QDateTime::currentMSecsSinceEpoch()),10,10,!silent};
+            awgTicket=ticket;
             QTimer::singleShot(10,this,[this,ticket] {if(observeHealth)observeHealth(ticket,health);});
         };
         port.cancel=[](B::Ticket t){t.gate->cancel();};
@@ -226,7 +334,8 @@ struct World : QObject {
             if (bindFailNextProbes>0) { --bindFailNextProbes; done(ticket,false,{},QStringLiteral("strict Android VPN socket binding failed")); return; }
             bool ok=!badProof && !tunnelDown;
             if (ok && failNextProbes>0) { --failNextProbes; ok=false; }
-            done(ticket,ok,{ticket.opaqueAttempt,request.nonce,"81.29.149.103",request.interfaceName,request.localAddress.toString(),true},{});
+            // The fixture's exit agent answers with the exit the request expects (5.1.0.27).
+            done(ticket,ok,{ticket.opaqueAttempt,request.nonce,request.expectedExitId,request.interfaceName,request.localAddress.toString()},{});
             if (!tunnelDown) health.rxTotal+=500; // a live tunnel still carries RX on a random probe miss
             health.txTotal+=500;
             QTimer::singleShot(10,this,[this,ticket] {if(observeHealth)observeHealth(ticket,health);});
@@ -252,7 +361,7 @@ struct World : QObject {
                 // Handover without replacement: the same running backend and session continue
                 // under the attempt ticket; its last handshake predates the adoption.
                 AwgHealthContext expected{identity,QString(64,'a'),selectedHost+":49963"};
-                r.expected=expected; current=fresh;
+                r.expected=expected; current=fresh; awgTicket=fresh;
                 health={expected.id,7,expected.peerPublicKey,expected.endpoint,"10.8.0.2","MayakFixture",
                         quint64(QDateTime::currentMSecsSinceEpoch()-adoptHandshakeAgeMs),10,10,true};
                 QTimer::singleShot(10,this,[this,fresh] { if (observeHealth) observeHealth(fresh,health); });
@@ -277,9 +386,28 @@ struct World : QObject {
             [this](const QString& path,const QJsonObject& payload,int){return transport(path,payload);});
         connection.setMayakRuntime(runtime.get());
         connect(runtime.get(),&MayakAutoConnectRuntime::stateChanged,this,[this](auto value,QString){state=value;});
+        // AWG connected check by counters (5.1.0.27): the device keeps sending; a live tunnel also
+        // receives, a stuck one (tunnelDown) does not. Xray keeps its probe-driven counters.
+        traffic.setInterval(100);
+        connect(&traffic,&QTimer::timeout,this,[this] {
+            if (!backendRunning || !observeHealth || !awgTicket.valid() || !health.valid || xrayActive || healthGone) return;
+            // idle: reports keep coming with unchanged counters (nobody uses the network).
+            if (!idle) {
+                health.txTotal+=500;
+                if (!tunnelDown && !stallRx) health.rxTotal+=500;
+            }
+            observeHealth(awgTicket,health);
+        });
+        traffic.start();
     }
     ~World() {
+        traffic.stop();
         if (runtime) disconnect(runtime.get(),nullptr,this,nullptr); // test-local captures may already be gone
+        // A later session must never reach this World nor a real address: every host answers.
+        MayakAutoConnectRuntime::setPortPrecheckForTests([](QObject*,const QStringList& hosts,quint16,int,std::function<void(QList<bool>)> done) {
+            done(QList<bool>(hosts.size(),true)); });
+        MayakAutoConnectRuntime::setWintunHealForTests([](QObject* ctx,std::function<void(bool,QString)> done) {
+            QTimer::singleShot(0,ctx,[done] { done(false,QString()); }); });
         // A cancelled fixture timer must not destroy an unfinished promise and
         // dispatch a result-less QFuture into the following test's event loop.
         // Drain synthetic transport work while this World's repositories live.
@@ -343,6 +471,7 @@ struct World : QObject {
         return {{"schema",1},{"paths",paths}};
     }
     int failConfigCount=0; // gateway unreachable (DNS/timeout) for the next N config fetches
+    int failReleaseTransport=0; // the next N releases never reach the server (connection reset)
     int failProvenCount=0; // no server answer for the next N "proven" reports
     bool refuseProven=false; // the server answers "proven": false
     bool errorProven=false;  // the server answers "proven" with an admission error
@@ -351,6 +480,14 @@ struct World : QObject {
         requestPayloads.append(payload);
         if(path.endsWith("config") && failConfigCount>0) {
             --failConfigCount; events<<"config_fail";
+            auto promise=std::make_shared<QPromise<GatewayPostResult>>(); promise->start(); auto future=promise->future();
+            allTransportPromises.append(promise);
+            QTimer::singleShot(5,this,[promise]{ if (promise->future().isFinished()) return;
+                promise->addResult({ErrorCode::ApiConfigDownloadError,{},false}); promise->finish(); });
+            return future;
+        }
+        if (payload.value("action").toString()=="release" && failReleaseTransport>0) {
+            --failReleaseTransport; events<<"release_fail";
             auto promise=std::make_shared<QPromise<GatewayPostResult>>(); promise->start(); auto future=promise->future();
             allTransportPromises.append(promise);
             QTimer::singleShot(5,this,[promise]{ if (promise->future().isFinished()) return;
@@ -824,7 +961,8 @@ private slots:
         World w;
         w.badProof=true;
         w.runtime->begin(w.id);
-        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,8000);
+        // AWG proof without a handshake waits for its proof time (6 s per exit) before failing.
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,25000);
         QCOMPARE(w.runtime->connectionPhase(),QStringLiteral("failed"));
         QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),2000);
 
@@ -850,7 +988,7 @@ private slots:
 
         QCOMPARE(w.connection.openConnection(w.id), ErrorCode::NoError);
         QCOMPARE(ui.connectionPhase(), QStringLiteral("preparing"));
-        QTRY_COMPARE_WITH_TIMEOUT(w.state, Vpn::ConnectionState::Error, 8000);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state, Vpn::ConnectionState::Error, 25000);
         for (const auto& phase : {QStringLiteral("fetching"), QStringLiteral("admitting"),
                                   QStringLiteral("starting"), QStringLiteral("verifying")})
             QVERIFY2(phases.contains(phase), qPrintable(QStringLiteral("UI missed phase: ") + phase));
@@ -915,7 +1053,7 @@ private slots:
         QVERIFY(protocol->clientConfig->nativeConfig.contains(QString("PrivateKey = %1\n").arg(keys.wireGuardClientPrivKey)));
     }
     void probeCloseFramingRemainsStrict() {
-        const QByteArray body = R"({"args":{"mayak_nonce":"n"},"origin":"203.0.113.9"})";
+        const QByteArray body = R"({"v":1,"exit":"exit-a","nonce":"n"})";
         const QByteArray headers = "HTTP/1.1 200 OK\r\nContent-Length: " + QByteArray::number(body.size()) + "\r\n\r\n";
         QByteArray parsed; QString error;
         QVERIFY(MayakTunnelProbe::parseHttpResponse(headers + body, &parsed, &error));
@@ -927,8 +1065,148 @@ private slots:
         QVERIFY(!MayakTunnelProbe::parseHttpResponse({}, &parsed, &error));
         QVERIFY(MayakTunnelProbe::parseHttpResponse("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + body, &parsed, &error));
         QCOMPARE(parsed, body);
-        QVERIFY(!MayakTunnelProbe::validateResponse(parsed, "another nonce", {"203.0.113.9"}, nullptr, &error));
-        QVERIFY(!MayakTunnelProbe::validateResponse(parsed, "n", {"203.0.113.10"}, nullptr, &error));
+        // 5.1.0.27: the exit agent's answer (no third-party site): nonce and this exit's id.
+        QString exitId;
+        QVERIFY(MayakTunnelProbe::validateAgentResponse(parsed, "n", "exit-a", &exitId, &error));
+        QCOMPARE(exitId, QStringLiteral("exit-a"));
+        QVERIFY(!MayakTunnelProbe::validateAgentResponse(parsed, "another nonce", "exit-a", nullptr, &error));
+        QVERIFY(!MayakTunnelProbe::validateAgentResponse(parsed, "n", "exit-b", nullptr, &error));
+        QVERIFY(!MayakTunnelProbe::validateAgentResponse(parsed, "n", "", nullptr, &error));
+        QVERIFY(!MayakTunnelProbe::validateAgentResponse(R"({"v":2,"exit":"exit-a","nonce":"n"})", "n", "exit-a", nullptr, &error));
+        QVERIFY(!MayakTunnelProbe::validateAgentResponse(R"({"v":1,"exit":"exit-a","nonce":"n","x":1})", "n", "exit-a", nullptr, &error));
+        QVERIFY(!MayakTunnelProbe::validateAgentResponse(R"({"v":1,"exit":"exit-a","nonce":"n","nonce":"n"})", "n", "exit-a", nullptr, &error));
+        QVERIFY(!MayakTunnelProbe::validateAgentResponse(R"({"args":{"mayak_nonce":"n"},"origin":"203.0.113.9"})", "n", "exit-a", nullptr, &error));
+        QCOMPARE(MayakTunnelProbe::agentAddress(), QStringLiteral("198.51.100.1"));
+        QCOMPARE(MayakTunnelProbe::agentPort(), quint16(80));
+    }
+    // Device test 21.11 (5.1.0.37): the agent answered through the race SOCKS entry and closed;
+    // the race deleted the probe inside QSslSocket's disconnected handling -> SIGSEGV in Qt.
+    // The owner deleting the probe from its finished signal must be safe, several times over.
+    void probeDeletedFromItsFinishedSignalAfterAgentClose() {
+        TinySocksAgent agent(QStringLiteral("2ac3fd72-a655-4f3c-b006-a3717a69b8b5"));
+        QVERIFY(agent.server.isListening());
+        for (int round=0; round<6; ++round) {
+            // Review R20 V-1: odd rounds have no Content-Length -> accepted on close, i.e. inside
+            // QSslSocket's disconnected handling, exactly where 5.1.0.37 crashed.
+            agent.lengthHeader=round%2 ? QByteArray() : QByteArray("Content-Length");
+            ProbeMessageCapture capture;
+            auto* probe=new MayakTunnelProbe;
+            bool done=false, ok=false; QString observed, error;
+            connect(probe,&MayakTunnelProbe::finished,this,
+                    [&](quint64, bool success, const MayakTunnelProbeProof& proof, const QString& why) {
+                done=true; ok=success; observed=proof.observedExitId; error=why;
+                delete probe; // synchronous, exactly like the race tearing down its probes
+            });
+            MayakTunnelProbeRequest request;
+            request.attemptTag=QStringLiteral("race-%1").arg(round);
+            request.nonce=QStringLiteral("nonce_%1_abcdef").arg(round);
+            request.expectedExitId=QStringLiteral("2AC3FD72-A655-4F3C-B006-A3717A69B8B5");
+            request.socksPort=agent.server.serverPort();
+            request.socksUser=QStringLiteral("u"); request.socksPassword=QStringLiteral("p");
+            request.deadlineMs=4000;
+            probe->start(request);
+            QTRY_VERIFY_WITH_TIMEOUT(done,5000);
+            QVERIFY2(ok,qPrintable(error));
+            QCOMPARE(observed,request.expectedExitId);
+            const QString seen=capturedProbeOutput.join(QLatin1Char('\n'));
+            QVERIFY(seen.contains(round%2 ? QStringLiteral("event=disconnected ") : QStringLiteral("event=content_complete ")));
+            QTest::qWait(50); // let the detached socket finish its close and its deferred delete
+        }
+    }
+    // Owner 21.11, variant 1: Xray on the exit keeps the connection open ~2 s after the agent
+    // answered. A complete Content-Length answer is accepted at once; trailing bytes never are.
+    void probeAcceptsCompleteAnswerWithoutWaitingForClose() {
+        TinySocksAgent agent(QStringLiteral("7818dff5-0ee3-4cce-acec-74f27e1ad842"));
+        agent.holdOpen=true;
+        auto run=[&](int deadline, bool* ok, QString* error, qint64* elapsed) {
+            MayakTunnelProbe probe;
+            bool done=false;
+            connect(&probe,&MayakTunnelProbe::finished,this,
+                    [&](quint64, bool success, const MayakTunnelProbeProof&, const QString& why) { done=true; *ok=success; *error=why; });
+            MayakTunnelProbeRequest request;
+            request.attemptTag=QStringLiteral("hold"); request.nonce=QStringLiteral("hold_nonce_1");
+            request.expectedExitId=QStringLiteral("7818dff5-0ee3-4cce-acec-74f27e1ad842");
+            request.socksPort=agent.server.serverPort();
+            request.socksUser=QStringLiteral("u"); request.socksPassword=QStringLiteral("p");
+            request.deadlineMs=deadline;
+            QElapsedTimer timer; timer.start();
+            probe.start(request);
+            QTRY_VERIFY_WITH_TIMEOUT(done,deadline+1000);
+            *elapsed=timer.elapsed();
+        };
+        bool ok=false; QString error; qint64 elapsed=0;
+        run(3000,&ok,&error,&elapsed);
+        QVERIFY2(ok,qPrintable(error));
+        QVERIFY2(elapsed<1500,qPrintable(QString::number(elapsed)));
+        agent.trailing="x"; // a longer answer than declared: no proof, never early
+        run(1500,&ok,&error,&elapsed);
+        QVERIFY(!ok);
+    }
+    // Variant 1, more cases (owner 21.11: no device test, more automated checks instead).
+    void probeEarlyCompletionEdgeCases() {
+        TinySocksAgent agent(QStringLiteral("ae9705a1-ae64-43cb-a106-8f0161ab48d2"));
+        agent.holdOpen=true;
+        int round=0;
+        auto run=[&](int deadline, bool* ok, QString* error, qint64* elapsed, QStringList* stages) {
+            ProbeMessageCapture capture;
+            MayakTunnelProbe probe;
+            bool done=false;
+            connect(&probe,&MayakTunnelProbe::finished,this,
+                    [&](quint64, bool success, const MayakTunnelProbeProof&, const QString& why) { done=true; *ok=success; *error=why; });
+            MayakTunnelProbeRequest request;
+            request.attemptTag=QStringLiteral("edge-%1").arg(++round); request.nonce=QStringLiteral("edge_nonce_%1").arg(round);
+            request.expectedExitId=QStringLiteral("ae9705a1-ae64-43cb-a106-8f0161ab48d2");
+            request.socksPort=agent.server.serverPort();
+            request.socksUser=QStringLiteral("u"); request.socksPassword=QStringLiteral("p");
+            request.deadlineMs=deadline;
+            QElapsedTimer timer; timer.start();
+            probe.start(request);
+            QTRY_VERIFY_WITH_TIMEOUT(done,deadline+1000);
+            *elapsed=timer.elapsed();
+            *stages=capturedProbeOutput;
+        };
+        bool ok=false; QString error; qint64 elapsed=0; QStringList stages;
+        auto saw=[&](const char* event) {
+            return stages.join(QLatin1Char('\n')).contains(QStringLiteral("event=%1 ").arg(QLatin1String(event)));
+        };
+
+        // 1. Body arrives in two parts 300 ms apart: not accepted after the first half, accepted
+        //    right after the second (well before the 2 s Xray would hold the connection).
+        agent.splitDelayMs=300;
+        run(3000,&ok,&error,&elapsed,&stages);
+        QVERIFY2(ok,qPrintable(error));
+        QVERIFY(saw("content_complete"));
+        QVERIFY2(elapsed>=280 && elapsed<1500,qPrintable(QString::number(elapsed)));
+        agent.splitDelayMs=0;
+
+        // 2. Header names are case-insensitive.
+        agent.lengthHeader="content-LENGTH";
+        run(3000,&ok,&error,&elapsed,&stages);
+        QVERIFY2(ok,qPrintable(error));
+        QVERIFY(elapsed<1500);
+        agent.lengthHeader="Content-Length";
+
+        // 3. Wrong nonce with the connection held open: rejected at once, never a proof.
+        agent.wrongNonce=true;
+        run(3000,&ok,&error,&elapsed,&stages);
+        QVERIFY(!ok);
+        QVERIFY2(elapsed<1500,qPrintable(QString::number(elapsed)));
+        agent.wrongNonce=false;
+
+        // 4. No Content-Length while the connection stays open: never early (the old close
+        //    framing applies), so the probe runs into its deadline without a proof.
+        agent.lengthHeader.clear();
+        run(1200,&ok,&error,&elapsed,&stages);
+        QVERIFY(!ok);
+        QVERIFY(!saw("content_complete"));
+        QVERIFY(elapsed>=1100);
+
+        // 5. No Content-Length, the agent closes: accepted at close as before.
+        agent.holdOpen=false;
+        run(3000,&ok,&error,&elapsed,&stages);
+        QVERIFY2(ok,qPrintable(error));
+        QVERIFY(saw("disconnected"));
+        QVERIFY(!saw("content_complete"));
     }
     void probeDiagnosticsAreStructuredAndRedacted() {
         ProbeMessageCapture capture;
@@ -938,7 +1216,7 @@ private slots:
         request.nonce = QStringLiteral("SECRET_NONCE_5108");
         request.interfaceName = QStringLiteral("SECRET_INTERFACE_5108");
         request.localAddress = QHostAddress(QStringLiteral("198.51.100.71"));
-        request.expectedEgressIpv4 = {QStringLiteral("203.0.113.71")};
+        request.expectedExitId = QStringLiteral("SECRET_EXIT_5108");
         request.deadlineMs = 1000;
         probe.start(request);
 
@@ -1558,15 +1836,16 @@ private slots:
     }
     void badProofNeverConnected() {
         World w;w.badProof=true;QSignalSpy spy(w.runtime.get(),&MayakAutoConnectRuntime::stateChanged);
-        w.runtime->begin(w.id);QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,6000);
+        w.runtime->begin(w.id);QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,25000);
         for(const auto& row:spy) QVERIFY(row.at(0).value<Vpn::ConnectionState>()!=Vpn::ConnectionState::Connected);
-        // A rejected proof stops/releases the first candidate before trying the second.
-        QCOMPARE(w.acquires,2);QCOMPARE(w.starts,2);QVERIFY(w.events.contains("probe"));
-        QCOMPARE(w.events.count("probe"),2);QCOMPARE(w.events.count("down"),2);QCOMPARE(w.releases,2);
+        // A rejected proof (no handshake answered) stops/releases the first candidate before trying
+        // the second. AWG proof sends nothing over the network (5.1.0.27): no probe at all.
+        QCOMPARE(w.acquires,2);QCOMPARE(w.starts,2);QVERIFY(!w.events.contains("probe"));
+        QCOMPARE(w.events.count("down"),2);QCOMPARE(w.releases,2);
         QStringList lifecycle;
         for(const auto& event:w.events)
             if(event=="start" || event=="probe" || event=="down" || event=="release") lifecycle<<event;
-        QCOMPARE(lifecycle,QStringList({"start","probe","down","release","start","probe","down","release"}));
+        QCOMPARE(lifecycle,QStringList({"start","down","release","start","down","release"}));
         QCOMPARE(w.records(),0);
     }
 
@@ -1628,7 +1907,7 @@ private slots:
         w.observeNetwork(w.current,true);
         QTRY_VERIFY_WITH_TIMEOUT(w.recovers>=1,3000);
         const QStringList after=w.events.mid(mark);
-        QCOMPARE(after.mid(0,after.indexOf("recover")).count("probe"),1);
+        QCOMPARE(after.mid(0,after.indexOf("recover")).count("probe"),0); // AWG: counters, no probe
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,3000);
         QCOMPARE(w.stops,stops);
         w.runtime->cancel();
@@ -1674,13 +1953,48 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
         QList<Vpn::ConnectionState> seen;
         connect(w.runtime.get(),&MayakAutoConnectRuntime::stateChanged,&w,[&seen](Vpn::ConnectionState s,QString){seen<<s;});
-        w.failNextProbes=1;
-        QTRY_COMPARE_WITH_TIMEOUT(w.failNextProbes,0,3000);
+        // AWG (5.1.0.27): exactly one failed check (data sent, nothing back), then data again.
+        ProbeMessageCapture capture;
+        w.stallRx=true;
+        QTRY_VERIFY_WITH_TIMEOUT(capturedProbeOutput.join(QStringLiteral(" | ")).contains(QStringLiteral("event=probe_failed consecutive=1")),3000);
+        w.stallRx=false; w.health.rxTotal+=500; w.observeHealth(w.awgTicket,w.health);
         QTest::qWait(1200);
+        QVERIFY(!capturedProbeOutput.join(QStringLiteral(" | ")).contains(QStringLiteral("event=probe_failed consecutive=2")));
         QVERIFY(!seen.contains(Vpn::ConnectionState::Reconnecting));
         QCOMPARE(w.recovers,0); QCOMPARE(w.state,Vpn::ConnectionState::Connected);
         w.runtime->cancel();
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
+    }
+
+    // Review R17 B-1: after "Reconnecting", an idle tunnel (nothing sent, nothing received) is no
+    // proof of life; "Connected" comes back only with data from our peer.
+    void idleAfterReconnectingNeverShowsConnectedWithoutData() {
+        FastRecoveryTiming timing; World w(true); w.recoverOk=false;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        w.tunnelDown=true;
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Reconnecting,5000);
+        w.idle=true; // the person stops using the network: no counters move at all
+        QTest::qWait(1500);
+        QCOMPARE(w.state,Vpn::ConnectionState::Reconnecting);
+        w.tunnelDown=false; w.idle=false; // data flows again: a passed check
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,3000);
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
+    }
+
+    // Review R17 B-2: the backend died (service/WinTun gone) while the UI is visible: no health
+    // report any more. Never "Connected" forever: the connected check fails and the path restarts.
+    void deadBackendWithoutHealthReconnects() {
+        FastRecoveryTiming timing; World w(false);
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        const int stops=w.stops;
+        w.healthGone=true;
+        QTRY_VERIFY_WITH_TIMEOUT(w.stops>stops,30000);
+        w.healthGone=false;
+        w.runtime->cancel();
+        QTRY_VERIFY_WITH_TIMEOUT(w.state==Vpn::ConnectionState::Disconnected || w.state==Vpn::ConnectionState::Error,8000);
     }
 
     void failedSoftRecoveryIsBoundedByBackoff() {
@@ -1814,6 +2128,10 @@ private slots:
         w.runtime->begin(w.id);
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,40000);
         QCOMPARE(w.events.count("local_fail"),2);
+        // The retry repaired WinTun first (once), and only then started a tunnel again.
+        QCOMPARE(w.heals,1);
+        QVERIFY(w.events.indexOf("heal")>w.events.lastIndexOf("local_fail"));
+        QVERIFY(w.events.indexOf("start",w.events.indexOf("heal"))>w.events.indexOf("heal"));
         QVERIFY(!seen.contains(Vpn::ConnectionState::Error));
         QVERIFY(std::any_of(texts.cbegin(),texts.cend(),[](const QString& t){
             return t.startsWith(QStringLiteral("VPN-адаптер Windows не запустился — повторим через")); }));
@@ -1838,6 +2156,101 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
         QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
     }
+    // A connect that succeeds needs no repair later; the user's cancel during a repair starts nothing.
+    void wintunRepairIsOnceAndCancellable() {
+        FastRecoveryTiming timing; useWindowsHealthMeaning();
+        World w; w.localFailStarts=2; w.holdHeal=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.heals,1,20000);
+        QTRY_COMPARE_WITH_TIMEOUT(w.runtime->message(),QStringLiteral("Восстанавливаем VPN-адаптер Windows…"),3000);
+        const int starts=w.starts;
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
+        QVERIFY(w.heldHeal);
+        w.heldHeal(true,QStringLiteral("healed")); // a late reply after the cancel
+        QTest::qWait(300);
+        QCOMPARE(w.starts,starts);
+        QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        // The repair was used up by that attempt: the next connect starts at once and connects.
+        w.holdHeal=false;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.heals,1);
+        settle(w);
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.heals,1);
+        settle(w);
+    }
+    // The first connect of a new app version repairs WinTun once in advance (an update over a running
+    // VPN may have cut the tunnel); later connects of the same version do not.
+    void wintunRepairOnTheFirstConnectOfANewVersion() {
+        FastRecoveryTiming timing; useWindowsHealthMeaning();
+        World w; w.settings.setValue("Mayak/wintunHealVersion",QStringLiteral("5.1.0.26"));
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.heals,1);
+        QVERIFY(w.events.indexOf("heal")<w.events.indexOf("start"));
+        QCOMPARE(w.settings.value("Mayak/wintunHealVersion").toString(),QStringLiteral(APP_VERSION));
+        settle(w);
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.heals,1);
+        settle(w);
+    }
+    // The "repair wanted" mark survives an app restart (an update restarts the app) and is used once.
+    void wintunRepairWantedSurvivesAnAppRestart() {
+        FastRecoveryTiming timing; useWindowsHealthMeaning();
+        World w; w.settings.setValue("Mayak/wintunHealWanted",true);
+        MayakAutoConnectRuntime::resetFailoverMemoryForTests(); // a fresh process: no in-memory mark
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.heals,1);
+        QVERIFY(!w.settings.value("Mayak/wintunHealWanted").toBool());
+        settle(w);
+    }
+    // "busy" (a Mayak tunnel still ran in the service): the repair stays wanted for the next start.
+    void wintunRepairBusyStaysWanted() {
+        FastRecoveryTiming timing; useWindowsHealthMeaning();
+        World w; w.settings.setValue("Mayak/wintunHealWanted",true); w.healResult=QStringLiteral("busy");
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.heals,1);
+        settle(w);
+        // Connected cleared it (the adapter worked after all): nothing is repeated.
+        QVERIFY(!w.settings.value("Mayak/wintunHealWanted").toBool());
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.heals,1);
+        settle(w);
+    }
+    // OFF while the repair runs at the start of a (restarted) session: nothing starts afterwards.
+    void wintunRepairInASessionStartIsCancellable() {
+        FastRecoveryTiming timing; useWindowsHealthMeaning();
+        World w; w.settings.setValue("Mayak/wintunHealWanted",true); w.holdHeal=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.heals,1,10000);
+        const int starts=w.starts;
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        w.heldHeal(true,QStringLiteral("healed"));
+        QTest::qWait(300);
+        QCOMPARE(w.starts,starts);
+        QCOMPARE(w.state,Vpn::ConnectionState::Disconnected);
+    }
+    // A repair whose service did not answer (older service, no pipe) still goes on with the retry.
+    void wintunRepairWithoutAnswerStillRetries() {
+        FastRecoveryTiming timing; useWindowsHealthMeaning();
+        World w; w.localFailStarts=2;
+        MayakAutoConnectRuntime::setWintunHealForTests([&w](QObject* ctx,std::function<void(bool,QString)> done) {
+            ++w.heals; QTimer::singleShot(0,ctx,[done] { done(false,QString()); }); });
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,40000);
+        QCOMPARE(w.heals,1);
+        settle(w);
+    }
     void localAdapterFailureOnOneExitStillConnectsInSameCycle() {
         FastRecoveryTiming timing; useWindowsHealthMeaning();
         World w; w.localFailStarts=1; // first exit: no interface; second exit connects normally
@@ -1851,8 +2264,10 @@ private slots:
         w.runtime->cancel();
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
         QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
-        // The exit was not blamed: the next connect starts with the server's first choice again.
+        // The exit was not blamed: the next connect starts with the server's first choice again
+        // (the exit memory of the second exit is cleared: only the failover memory is checked here).
         QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        w.settings.setValue("Mayak/exitMemory",QByteArray());
         w.runtime->begin(w.id);
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
         QCOMPARE(w.lastAcquireCandidate(),w.first);
@@ -1868,6 +2283,8 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,40000);
         QCOMPARE(w.events.count("local_fail"),1);
         QCOMPARE(w.events.count("down_unconfirmed"),1);
+        QCOMPARE(w.heals,1); // the restarted session repaired WinTun before its first start
+        QVERIFY(w.events.indexOf("heal")>w.events.indexOf("local_fail"));
         QVERIFY(!seen.contains(Vpn::ConnectionState::Error));
         QVERIFY(std::any_of(texts.cbegin(),texts.cend(),[](const QString& t){
             return t.startsWith(QStringLiteral("VPN-адаптер Windows не запустился — повторим через")); }));
@@ -1941,7 +2358,8 @@ private slots:
 #else
         QVERIFY(!defaults.noHealthMeansLocalFailure);
 #endif
-        QCOMPARE(defaults.localStartRetryMs,(QList<qint64>{30000,60000,120000,240000,300000}));
+        // The first retry repairs WinTun first, so it comes sooner; the total budget stays.
+        QCOMPARE(defaults.localStartRetryMs,(QList<qint64>{10000,30000,60000,120000,240000,300000}));
     }
     void localAdapterRetryIsCancelledByUser() {
         FastRecoveryTiming timing; useWindowsHealthMeaning();
@@ -2176,6 +2594,277 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
         QCOMPARE(w.acquires,acquires+1);
         QCOMPARE(w.lastAcquireCandidate(),w.second);
+        settle(w);
+    }
+
+    // r10: a release that never reached the server right after the tunnel stop (Android: the dying
+    // VPN network reset the new connection) is sent again; the disconnect completes normally.
+    void releaseNotReachingTheServerIsSentAgain() {
+        FastRecoveryTiming timing; World w(true);
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        w.failReleaseTransport=1;
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
+        QCOMPARE(w.events.count("release_fail"),1);
+        QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+    }
+    // Bounded: a release that keeps failing ends with the usual cleanup hint after 3 tries.
+    void releaseResendIsBounded() {
+        FastRecoveryTiming timing; World w(true);
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        w.failReleaseTransport=100;
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,6000);
+        QCOMPARE(w.events.count("release_fail"),3);
+        QTest::qWait(500);
+        QCOMPARE(w.events.count("release_fail"),3);
+        w.failReleaseTransport=0;
+        w.runtime->retryCleanup();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,8000);
+        QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
+    }
+
+    // 5.1.0.27 r4, exit memory: the exit that proved on this network is tried first next time,
+    // even when the server lists another one first.
+    void rememberedExitIsTriedFirstOnTheNextConnect() {
+        FastRecoveryTiming timing; World w(true);
+        w.silentFirst=true; // the first exit does not answer here: the second one proves
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,25000);
+        QCOMPARE(w.lastAcquireCandidate(),w.second);
+        settle(w);
+        w.silentFirst=false; MayakAutoConnectRuntime::resetFailoverMemoryForTests(); // only the exit memory remains
+        const int acquires=w.acquires;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.acquires,acquires+1);
+        QCOMPARE(w.acquireCandidate(acquires),w.second);
+        settle(w);
+    }
+
+    // A remembered exit that does not come up is forgotten: the server order applies again.
+    void failedRememberedExitIsForgotten() {
+        FastRecoveryTiming timing; World w(true);
+        w.silentFirst=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,25000);
+        settle(w);
+        w.silentFirst=false; w.silentHost="81.29.149.104"; // the remembered exit is now silent
+        MayakAutoConnectRuntime::resetFailoverMemoryForTests();
+        int acquires=w.acquires;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,25000);
+        QCOMPARE(w.acquireCandidate(acquires),w.second);   // still tried first once
+        QCOMPARE(w.lastAcquireCandidate(),w.first);
+        settle(w);
+        w.silentHost.clear(); MayakAutoConnectRuntime::resetFailoverMemoryForTests();
+        acquires=w.acquires;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.acquireCandidate(acquires),w.first);
+        settle(w);
+    }
+
+    // Port precheck: one TCP check of every exit's Xray port (443) at once; an exit that does not
+    // answer goes last (never dropped).
+    void portPrecheckMovesAnUnansweredExitLast() {
+        FastRecoveryTiming timing; World w(true);
+        w.tcpDeadHosts={"81.29.149.103"};
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.prechecks,1); QCOMPARE(w.precheckPort,quint16(443));
+        QCOMPARE(w.acquireCandidate(0),w.second);
+        settle(w);
+    }
+
+    void portPrecheckWithoutAnyAnswerKeepsTheServerOrder() {
+        FastRecoveryTiming timing; World w(true);
+        w.tcpDeadHosts={"81.29.149.103","81.29.149.104"};
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.prechecks,1);
+        QCOMPARE(w.acquireCandidate(0),w.first);
+        settle(w);
+    }
+
+    void portPrecheckIsSkippedForASingleExit() {
+        FastRecoveryTiming timing; World w(true);
+        w.singleCandidate=true; w.tcpDeadHosts={"81.29.149.103"};
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.prechecks,0);
+        settle(w);
+    }
+
+    // The unanswered exit is still tried with AWG, but its Xray paths on port 443 are skipped.
+    void portPrecheckSkipsXrayOfAnUnansweredExit() {
+        FastRecoveryTiming timing; CoordinatorTimingGuard guard;
+        auto& t=mayak::autoconnect::Coordinator::timing(); t.awgVerifyMs=500; t.xrayVerifyMs=500;
+        World w(true);
+        w.offerXray=true; w.tcpDeadHosts={"81.29.149.103"};
+        w.silentFirst=true;                                          // first exit: AWG silent, Xray would work
+        w.silentHost="81.29.149.104"; w.xrayDeadHost="81.29.149.104"; // second exit: nothing works
+        w.runtime->begin(w.id);
+        QTRY_VERIFY_WITH_TIMEOUT(w.acquires>=2 && w.startHosts.contains("81.29.149.103/awg"),20000);
+        QTest::qWait(1500);
+        QCOMPARE(w.acquireCandidate(0),w.second);
+        QVERIFY(w.startHosts.contains("81.29.149.104/xray"));
+        QVERIFY(!w.startHosts.contains("81.29.149.103/xray"));
+        settle(w);
+    }
+
+    // Exit memory: the network check removes the tunnel by its address, whatever its interface is
+    // called (Windows: Qt "ethernet_32777", the service "MayakVPN").
+    void sameLocalNetworkIgnoresTheTunnelByAddress() {
+        const QStringList before{"wireless_32768/192.168.1.0/24"};
+        QVERIFY(MayakAutoConnectRuntime::sameLocalNetworkForTests(before,{"ethernet_32777/10.8.0.2/32","wireless_32768/192.168.1.0/24"},"10.8.0.2"));
+        QVERIFY(MayakAutoConnectRuntime::sameLocalNetworkForTests(before,{"tun0/10.8.0.0/24","wireless_32768/192.168.1.0/24"},"10.8.0.2/32"));
+        // A lingering adapter of the previous session at start is removed as well.
+        QVERIFY(MayakAutoConnectRuntime::sameLocalNetworkForTests({"ethernet_32777/10.8.0.2/32","wireless_32768/192.168.1.0/24"},
+            {"ethernet_32777/10.8.0.2/32","wireless_32768/192.168.1.0/24"},"10.8.0.2"));
+        QVERIFY(!MayakAutoConnectRuntime::sameLocalNetworkForTests(before,{"ethernet_32777/10.8.0.2/32","rmnet0/100.64.0.0/10"},"10.8.0.2"));
+        QVERIFY(!MayakAutoConnectRuntime::sameLocalNetworkForTests(before,before,QString()));   // no address: not compared
+        QVERIFY(!MayakAutoConnectRuntime::sameLocalNetworkForTests({},{},"10.8.0.2"));
+    }
+
+    // The real port check (loopback only): a listening port answers, a refused one does not, the
+    // result comes once, in host order, and no socket is left behind.
+    void realPortPrecheckReportsEachHostOnce() {
+        QTcpServer server; QVERIFY(server.listen(QHostAddress::LocalHost,0));
+        QObject context; QList<QList<bool>> results; QElapsedTimer clock; clock.start();
+        MayakAutoConnectRuntime::realPortPrecheckForTests()(&context,{"127.0.0.1","127.0.0.2","127.0.0.1"},server.serverPort(),3000,
+            [&results](QList<bool> answered) { results<<answered; });
+        QTRY_COMPARE_WITH_TIMEOUT(results.size(),1,5000);
+        QCOMPARE(results.first(),(QList<bool>{true,false,true})); // refused: Windows retries it until the timeout
+        QTest::qWait(500);
+        QCOMPARE(results.size(),1);
+        QTRY_COMPARE_WITH_TIMEOUT(context.findChildren<QTcpSocket*>().size(),0,2000);
+        // Every host answered: the result comes before the timeout, and the timeout adds nothing.
+        results.clear(); clock.restart();
+        MayakAutoConnectRuntime::realPortPrecheckForTests()(&context,{"127.0.0.1","127.0.0.1"},server.serverPort(),3000,
+            [&results](QList<bool> answered) { results<<answered; });
+        QTRY_COMPARE_WITH_TIMEOUT(results.size(),1,5000);
+        QCOMPARE(results.first(),(QList<bool>{true,true}));
+        QVERIFY2(clock.elapsed()<2000,qPrintable(QString::number(clock.elapsed())));
+        QTest::qWait(3200);
+        QCOMPARE(results.size(),1);
+        QTRY_COMPARE_WITH_TIMEOUT(context.findChildren<QTcpSocket*>().size(),0,2000);
+    }
+
+    // The real port check ends at its timeout when a host never answers (a listener whose backlog
+    // is never accepted still completes TCP; so a held, never-finishing host is simulated by a
+    // timeout shorter than any answer is possible: 1 ms).
+    void realPortPrecheckEndsAtItsTimeout() {
+        QTcpServer server; QVERIFY(server.listen(QHostAddress::LocalHost,0));
+        QObject context; QList<QList<bool>> results;
+        MayakAutoConnectRuntime::realPortPrecheckForTests()(&context,{"127.0.0.1"},server.serverPort(),1,
+            [&results](QList<bool> answered) { results<<answered; });
+        QTRY_COMPARE_WITH_TIMEOUT(results.size(),1,3000);
+        QCOMPARE(results.first().size(),1);
+        QTest::qWait(200);
+        QCOMPARE(results.size(),1);
+        QTRY_COMPARE_WITH_TIMEOUT(context.findChildren<QTcpSocket*>().size(),0,2000);
+    }
+
+    // A remembered Xray path (it proved after AWG did not, auto mode) leads the next connect on this
+    // network; the race of the Xray paths still runs (a dead remembered path costs no tunnel start).
+    void rememberedXrayPathLeadsTheNextConnect() {
+        FastRecoveryTiming timing; World w(true);
+        w.offerXray=true; w.withRace=true; w.raceEngineOk=false; w.awgSilent=true; // race runs, server order
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,30000);
+        QCOMPARE(w.raceStarts,1);
+        const QString proved=w.startedProtocols.last();
+        QCOMPARE(proved,QStringLiteral("xray"));
+        settle(w);
+        const int races=w.raceStarts, starts=w.startedProtocols.size();
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.raceStarts,races+1);                          // raced, not skipped
+        QCOMPARE(w.startedProtocols.size(),starts+1);            // the first start proved
+        QCOMPARE(w.startedProtocols.last(),QStringLiteral("xray"));
+        QCOMPARE(w.runtime->exitLocation().value("pathId").toString(),QStringLiteral("xray-firefox"));
+        settle(w);
+    }
+
+    // An Xray path that proved in a fixed method ("only Xray") is not kept for automatic mode:
+    // there AWG is tried first again.
+    void xrayPathOfAFixedMethodIsNotRemembered() {
+        FastRecoveryTiming timing; World w(true);
+        w.offerXray=true; w.app.setMayakConnectionMethod("xray");
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,30000);
+        QCOMPARE(w.startedProtocols.last(),QStringLiteral("xray"));
+        settle(w);
+        w.app.setMayakConnectionMethod("auto");
+        const int starts=w.startedProtocols.size();
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.startedProtocols.at(starts),QStringLiteral("awg"));
+        settle(w);
+    }
+
+    // After a failed AWG path the Xray paths of the same exit are raced (no tunnel), not tried one
+    // by one: here nobody answers the race, so no Xray tunnel starts and the next exit follows.
+    void xrayRaceRunsAfterAFailedAwgPath() {
+        FastRecoveryTiming timing;
+        World w(true);
+        w.offerXray=true; w.withRace=true; w.silentFirst=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,30000);
+        QCOMPARE(w.raceStarts,1);
+        QVERIFY(!w.startHosts.contains("81.29.149.103/xray"));
+        QCOMPARE(w.lastAcquireCandidate(),w.second);
+        settle(w);
+    }
+
+    // AWG quick give-up: no handshake within awgNoHandshakeMs ends the path before the full proof
+    // time; the exit is still tried last on the next connect.
+    void awgQuickGiveUpEndsASilentPathEarly() {
+        FastRecoveryTiming timing;
+        auto t=MayakAutoConnectRuntime::recoveryTiming(); t.awgNoHandshakeMs=800;
+        MayakAutoConnectRuntime::setRecoveryTimingForTests(t);
+        World w(true);
+        w.silentFirst=true;
+        QElapsedTimer clock; clock.start();
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QVERIFY2(clock.elapsed()<4000,qPrintable(QString::number(clock.elapsed())));
+        QCOMPARE(w.acquireCandidate(0),w.first);
+        QCOMPARE(w.lastAcquireCandidate(),w.second);
+        settle(w);
+    }
+
+    // The last option (one exit, AWG only) keeps the full proof time: no quick give-up.
+    void awgQuickGiveUpIsNotUsedForTheLastOption() {
+        FastRecoveryTiming timing; CoordinatorTimingGuard guard;
+        mayak::autoconnect::Coordinator::timing().awgVerifyMs=2000;
+        auto t=MayakAutoConnectRuntime::recoveryTiming(); t.awgNoHandshakeMs=500;
+        MayakAutoConnectRuntime::setRecoveryTimingForTests(t);
+        World w(true);
+        w.singleCandidate=true; w.awgSilent=true;
+        w.offerXray=true; w.xrayDead=true; // Xray paths of the last exit are no reason to give AWG up early
+        QElapsedTimer clock; clock.start();
+        w.runtime->begin(w.id);
+        QTRY_VERIFY_WITH_TIMEOUT(w.stops>=1,10000);
+        QVERIFY2(clock.elapsed()>=1800,qPrintable(QString::number(clock.elapsed())));
+        settle(w);
+    }
+
+    // The quick give-up never ends a path whose handshake came.
+    void awgQuickGiveUpKeepsAnAnsweringPath() {
+        FastRecoveryTiming timing;
+        auto t=MayakAutoConnectRuntime::recoveryTiming(); t.awgNoHandshakeMs=800;
+        MayakAutoConnectRuntime::setRecoveryTimingForTests(t);
+        World w(true);
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.acquires,1);
+        QTest::qWait(1200);
+        QCOMPARE(w.state,Vpn::ConnectionState::Connected);
         settle(w);
     }
 

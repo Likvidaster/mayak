@@ -165,6 +165,8 @@ SheetType {
         function onUpdateFound() {
             const manual = root.manualCheckPending
             root.manualCheckPending = false
+            // Automatic updates install by themselves: no window unless the user asked (device test 21.11).
+            if (!manual && UpdateController.autoUpdateEnabled) return
             root.offerUpdate(UpdateController.version, manual)
         }
         function onUpdateNotFound() { root.clearUpdateOffer() }

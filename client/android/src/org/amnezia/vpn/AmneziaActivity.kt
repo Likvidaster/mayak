@@ -1383,6 +1383,35 @@ class AmneziaActivity : QtActivity() {
         }
     }
 
+    // Mayak automatic update: install the verified package in the background when the phone is not
+    // in use (MayakUpdateInstaller). 0 failed, 1 scheduled, 2 "install unknown apps" not allowed.
+    @Suppress("unused")
+    fun scheduleBackgroundUpdate(path: String): Int = MayakUpdateInstaller.scheduleAsync(applicationContext, path)
+
+    @Suppress("unused")
+    fun scheduleUpdateDownload(url: String, size: Long, sha256: String, version: String): Int =
+        MayakUpdateInstaller.scheduleDownload(applicationContext, url, size, sha256, version)
+
+    @Suppress("unused")
+    fun cancelBackgroundUpdate() = MayakUpdateInstaller.cancel(applicationContext)
+
+    @Suppress("unused")
+    fun canInstallUpdates(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()
+
+    @Suppress("unused")
+    fun openInstallPermissionSettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) runCatching {
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+        }
+    }
+
+    // Mayak: Android's own "Always-on VPN" / "Block connections without VPN" page.
+    @Suppress("unused")
+    fun openVpnSystemSettings() {
+        runCatching { startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }
+    }
+
     @Suppress("unused")
     fun openFile(filter: String?) {
         Log.v(TAG, "Open file with filter: $filter")

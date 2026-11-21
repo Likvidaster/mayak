@@ -1,3 +1,4 @@
+#include "core/controllers/mayakWindowsAutoUpdater.h"
 #include "coreController.h"
 #include "ui/controllers/mayakRoutingUiController.h"
 #include "ui/controllers/mayakCityPhotoUiController.h"
@@ -199,6 +200,9 @@ void CoreController::initCoreControllers()
 void CoreController::initControllers()
 {
     m_connectionUiController = new ConnectionUiController(m_connectionController, m_serversController, this);
+#ifdef Q_OS_WIN
+    new MayakWindowsAutoUpdater(m_updateController, m_connectionController, this);
+#endif
     setQmlContextProperty("ConnectionController", m_connectionUiController);
 
     if (m_engine) {
@@ -338,6 +342,21 @@ void CoreController::initSignalHandlers()
         m_apiNewsUiController->fetchNews(false);
     }
 
+}
+
+void CoreController::mayakAfterUpdate(bool reconnect)
+{
+    // Connect only when nothing is connected or connecting (auto-connect may already have started):
+    // never toggle, a toggle would cancel that connect.
+    MayakWindowsAutoUpdater::afterUpdate(m_connectionController, reconnect, [this] {
+        const QString phase = m_connectionUiController->connectionPhase();
+        const bool idle = phase.isEmpty() || phase == QLatin1String("idle") || phase == QLatin1String("failed")
+                          || phase == QLatin1String("cancelled");
+        if (!idle || m_connectionUiController->isConnected() || m_connectionUiController->isConnectionInProgress()
+            || m_connectionUiController->cleanupPending())
+            return;
+        m_connectionUiController->toggleConnection();
+    });
 }
 
 void CoreController::checkForAppUpdates()

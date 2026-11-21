@@ -63,6 +63,21 @@ bool parsePrepareSplitTunnelReply(const QByteArray& line, const QString& request
 void requestPrepareSplitTunnel(QObject* ctx, std::function<void(bool replied, QString result)> done,
                                int timeoutMs = 25000);
 
+// Windows refused to create Mayak's tunnel adapter: asks the service to repair the WinTun state with one
+// temporary adapter (see mayakwintunheal.h). done(replied, result) runs once on ctx's thread, never inside
+// a socket signal; result is "healed", "busy", "no_wintun" or "create_failed".
+QByteArray healWintunRequestLine(const QString& requestId);
+bool parseHealWintunReply(const QByteArray& line, const QString& requestId, QString* result);
+void requestHealWintun(QObject* ctx, std::function<void(bool replied, QString result)> done, int timeoutMs = 15000);
+
+// Mayak automatic update (Windows): asks the service to install a verified update (it verifies the
+// signed envelope and the package itself). done(replied, result) runs once on ctx's thread;
+// result: "started", "rejected", "busy" or "failed".
+void requestApplyUpdate(QObject* ctx, const QByteArray& signedEnvelope, const QString& packagePath, bool vpnWasOn,
+                        std::function<void(bool replied, QString result)> done, int timeoutMs = 30000);
+// The app reconnected after an update: the update guard lifts its traffic block. Fire and forget.
+void notifyUpdateConnected();
+
 // Mayak Xray path (Windows): asks the service to end tun2socks processes of this installation
 // (a tunnel left by an ended app). Blocking, bounded by timeoutMs. Returns the number ended, -1
 // when the service did not answer.

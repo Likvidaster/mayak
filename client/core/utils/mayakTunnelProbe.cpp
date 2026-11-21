@@ -6,6 +6,7 @@
 #include <QJsonParseError>
 #include <QHostAddress>
 #include <QHostInfo>
+#include <QCryptographicHash>
 #include <QNetworkProxy>
 #include <QSslSocket>
 #include <QTimer>
@@ -40,11 +41,23 @@
 
 namespace {
 constexpr qsizetype MaxResponse = 64 * 1024;
-const QStringList Hosts{QStringLiteral("httpbingo.org"), QStringLiteral("httpbin.org")};
+// The exit agent (5.1.0.27): a TEST-NET-2 address (RFC 5737), never routed on the internet, never
+// a LAN or a Russian range (198.18.0.0/15 is avoided: it is a TUN/fake-ip range in many clients).
+// Only our exit's Xray routes it, to its local agent; nothing leaves the exit.
+const QString AgentHost = QStringLiteral("198.51.100.1");
 
-bool validIpv4(const QString &text) {
-    QHostAddress ip;
-    return ip.setAddress(text) && ip.protocol() == QAbstractSocket::IPv4Protocol && ip.toString() == text;
+// The agent takes exactly 32 hex: derived from the proof nonce, so its echo is still bound to it.
+QString agentNonceFor(const QString &nonce) {
+    return QString::fromLatin1(QCryptographicHash::hash(nonce.toUtf8(), QCryptographicHash::Sha256).toHex().left(32));
+}
+constexpr quint16 AgentPort = 80;
+
+bool validNonce(const QString &nonce) {
+    if (nonce.isEmpty() || nonce.size() > 128) return false;
+    for (const QChar c : nonce)
+        if (!((c >= QLatin1Char('0') && c <= QLatin1Char('9')) || (c >= QLatin1Char('a') && c <= QLatin1Char('z')) ||
+              (c >= QLatin1Char('A') && c <= QLatin1Char('Z')) || c == QLatin1Char('-') || c == QLatin1Char('_'))) return false;
+    return true;
 }
 
 class JsonObjectKeyScanner {
@@ -164,32 +177,6 @@ private:
     qsizetype m_pos = 0;
 };
 
-bool responseNonceMatches(const QByteArray &body, const QString &nonce, QString *returned) {
-    if (!JsonObjectKeyScanner(body).hasUniqueKeys()) return false;
-    QJsonParseError parseError{};
-    const auto doc = QJsonDocument::fromJson(body, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) return false;
-    const auto args = doc.object().value("args");
-    const auto value = args.isObject() ? args.toObject().value("mayak_nonce") : QJsonValue();
-    QString result;
-    if (value.isString()) result = value.toString();
-    else if (value.isArray() && value.toArray().size() == 1 && value.toArray().first().isString())
-        result = value.toArray().first().toString();
-    if (returned) *returned = result;
-    return result == nonce;
-}
-
-bool responseEgressMatches(const QByteArray &body, const QStringList &expected, QString *observed) {
-    if (!JsonObjectKeyScanner(body).hasUniqueKeys()) return false;
-    QJsonParseError parseError{};
-    const auto doc = QJsonDocument::fromJson(body, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) return false;
-    const QString origin = doc.object().value("origin").toString();
-    const QString first = origin.section(',', 0, 0).trimmed();
-    if (!validIpv4(first) || !expected.contains(first)) return false;
-    if (observed) *observed = first;
-    return true;
-}
 
 bool parseHttp(const QByteArray &wire, QByteArray *body, QString *error) {
     if (wire.size() > MaxResponse) { *error = "response exceeds 64 KiB"; return false; }
@@ -272,7 +259,8 @@ QStringList openSslErrorCodeTokens(const QString &errorString) {
 
 MayakTunnelProbe::MayakTunnelProbe(QObject *parent) : QObject(parent) {}
 
-QStringList MayakTunnelProbe::echoHosts() { return Hosts; }
+QString MayakTunnelProbe::agentAddress() { return AgentHost; }
+quint16 MayakTunnelProbe::agentPort() { return AgentPort; }
 
 bool MayakTunnelProbe::parseHttpResponse(const QByteArray &wire, QByteArray *body, QString *error) {
     return parseHttp(wire, body, error);
@@ -302,19 +290,29 @@ public:
         });
     }
 
+    // Device test 21.11 (5.1.0.37, Xray SOCKS race): the agent closes the connection, QSslSocket
+    // emits disconnected from inside its own close handling, the probe reports its result and the
+    // caller deletes the probe synchronously; QSslSocket then touched its freed state (SIGSEGV).
+    // The socket is therefore never destroyed with the run: it is detached and deleted later,
+    // after the event that is running on it has returned.
+    ~ProbeRun() override {
+        if (auto *socket = m_socket.data()) {
+            m_socket.clear();
+            QObject::disconnect(socket, nullptr, this, nullptr);
+            socket->setParent(nullptr);
+            socket->abort();
+            socket->deleteLater();
+        }
+    }
+
     void start() {
-        const bool socksOk = m_request.viaSocks() && m_request.pinnedEndpoints.isEmpty() &&
+        const bool socksOk = m_request.viaSocks() &&
             m_request.interfaceName.isEmpty() && !m_request.socksUser.isEmpty() && !m_request.socksPassword.isEmpty();
         const bool interfaceOk = !m_request.viaSocks() && !m_request.interfaceName.isEmpty() &&
             m_request.localAddress.protocol() == QAbstractSocket::IPv4Protocol;
-        if (!m_request.attemptTag.isEmpty() && !m_request.nonce.isEmpty() && m_request.nonce.size() <= 128 &&
-            (socksOk || interfaceOk) && (!m_request.expectedEgressIpv4.isEmpty() || m_request.acceptAnyPublicEgress) &&
-            m_request.deadlineMs >= 1 && m_request.deadlineMs <= 8000) {
-            for (const auto &ip : m_request.expectedEgressIpv4)
-                if (!validIpv4(ip)) { finish(false, {}, "invalid expected egress IPv4"); return; }
-            for (const auto &e : m_request.pinnedEndpoints)
-                if (!Hosts.contains(e.host) || !validIpv4(e.ipv4)) { finish(false, {}, "invalid pinned endpoint"); return; }
-        } else {
+        if (m_request.attemptTag.isEmpty() || !validNonce(m_request.nonce) || !(socksOk || interfaceOk) ||
+            m_request.expectedExitId.isEmpty() || m_request.expectedExitId.size() > 128 ||
+            m_request.deadlineMs < 1 || m_request.deadlineMs > 8000) {
             finish(false, {}, "invalid probe request"); return;
         }
         m_elapsed.restart();
@@ -324,11 +322,33 @@ public:
     }
 
 private:
+    static bool declaresContentLength(const QByteArray &wire) {
+        const qsizetype split = wire.indexOf("\r\n\r\n");
+        return split >= 0 && wire.left(split).toLower().contains("\ncontent-length:");
+    }
+
+    // Validates the complete agent response once: after the declared body arrived or after close.
+    void completeResponse(int attempt, const QString &stage) {
+        if (m_finished || attempt != m_attempt || m_attemptRejected || m_responseCompleted) return;
+        m_responseCompleted = true;
+        logStage(stage);
+        if (!m_requestSent) { failAttempt(attempt, "exit agent connection closed before the request"); return; }
+        QByteArray body; QString error; QString exitId;
+        m_parseOk = parseHttp(m_wire, &body, &error);
+        m_agentOk = m_parseOk &&
+            MayakTunnelProbe::validateAgentResponse(body, agentNonceFor(m_request.nonce), m_request.expectedExitId, &exitId, &error);
+        if (!m_agentOk) { failAttempt(attempt, error); return; }
+        MayakTunnelProbeProof proof;
+        proof.attemptTag = m_request.attemptTag; proof.nonce = m_request.nonce;
+        proof.observedExitId = exitId; proof.interfaceName = m_request.interfaceName;
+        proof.localAddress = m_request.localAddress.toString();
+        finish(true, proof, {});
+    }
+
     void finish(bool ok, MayakTunnelProbeProof proof, const QString &error) {
         if (m_finished) return;
         logStage(ok ? QStringLiteral("finish_ok") : QStringLiteral("finish_error"),
-                 QStringLiteral("http_parse_ok=%1 nonce_ok=%2 egress_ok=%3")
-                     .arg(m_parseOk).arg(m_nonceOk).arg(m_egressOk));
+                 QStringLiteral("http_parse_ok=%1 agent_ok=%2").arg(m_parseOk).arg(m_agentOk));
         m_finished = true;
         m_deadline->stop();
         m_bindRetry->stop();
@@ -356,7 +376,7 @@ private:
     void failAttempt(int attempt, const QString &reason) {
         if (m_finished || attempt != m_attempt) return;
         if (m_hostIndex < hostCount()) openNextEndpoint();
-        else finish(false, {}, reason.isEmpty() ? QStringLiteral("all HTTPS echo endpoints failed") : reason);
+        else finish(false, {}, reason.isEmpty() ? QStringLiteral("exit agent did not answer") : reason);
     }
 
     void scheduleRetry(int attempt, const QString &reason) {
@@ -377,11 +397,11 @@ private:
             auto *old = m_socket.data();
             m_socket.clear();
             old->disconnect(this);
+            old->setParent(nullptr); // review R20: never destroyed together with this run
             old->abort();
             old->deleteLater();
         }
-        if (!retrySourceBind && hostCount() <= m_hostIndex) { finish(false, {}, "all HTTPS echo endpoints failed"); return; }
-        if (!retrySourceBind) m_currentIpv4 = pinnedIpv4At(m_hostIndex);
+        if (!retrySourceBind && hostCount() <= m_hostIndex) { finish(false, {}, "exit agent did not answer"); return; }
         const QString host = retrySourceBind ? m_currentHost : hostAt(m_hostIndex++);
         if (!retrySourceBind) m_currentHost = host;
         m_endpointIndex = m_hostIndex;
@@ -396,6 +416,7 @@ private:
         m_tlsEstablished = false;
         m_attemptRejected = false;
         m_responseCompleted = false;
+        m_requestSent = false;
         m_socket = new QSslSocket(this);
         if (m_request.viaSocks()) {
             // The race engine's own local entry; the host name is resolved behind the proxy.
@@ -407,23 +428,18 @@ private:
         connect(socket, &QSslSocket::hostFound, this, [this, attempt] {
             if (!m_finished && attempt == m_attempt) logStage(QStringLiteral("host_found"));
         });
-        connect(socket, &QSslSocket::connected, this, [this, attempt] {
+        connect(socket, &QSslSocket::connected, this, [this, attempt, host] {
             if (m_finished || attempt != m_attempt || m_attemptRejected) return;
             if (!boundIdentityMatches()) {
                 scheduleRetry(attempt, "bound socket identity changed"); return;
             }
             logStage(QStringLiteral("tcp_connected"));
-        });
-        connect(socket, &QSslSocket::encrypted, this, [this, attempt, host] {
-            if (m_finished || attempt != m_attempt || m_attemptRejected || !m_socket || !m_socket->isEncrypted()) return;
-            if (!boundIdentityMatches()) {
-                scheduleRetry(attempt, "bound socket identity changed"); return;
-            }
-            m_tlsEstablished = true;
-            logStage(QStringLiteral("tls_encrypted"));
-            const QByteArray path = QByteArray("/get?mayak_nonce=") + QUrl::toPercentEncoding(m_request.nonce);
+            // Plain HTTP to the exit agent: the Xray tunnel itself (VLESS+Reality, pinned key)
+            // is the encryption and authenticity; only our exit can answer inside it.
+            m_requestSent = true;
+            const QByteArray path = QByteArray("/mayak-proof?n=") + agentNonceFor(m_request.nonce).toLatin1();
             m_socket->write("GET " + path + " HTTP/1.1\r\nHost: " + host.toUtf8() +
-                            "\r\nUser-Agent: MayakVPN/5.1\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n");
+                            "\r\nConnection: close\r\nAccept-Encoding: identity\r\n\r\n");
         });
         connect(socket, &QSslSocket::readyRead, this, [this, attempt] {
             if (m_finished || attempt != m_attempt || !m_socket) return;
@@ -432,45 +448,23 @@ private:
                 m_firstReadLogged = true;
                 logStage(QStringLiteral("first_ready_read"));
             }
-            if (m_wire.size() > MaxResponse) failAttempt(attempt, "response exceeds 64 KiB");
+            if (m_wire.size() > MaxResponse) { failAttempt(attempt, "response exceeds 64 KiB"); return; }
+            // Owner 21.11 (variant 1): Xray on the exit keeps the client side open ~2 s after the
+            // agent has closed (uplinkOnly). A response that declares Content-Length is complete
+            // once exactly that many body bytes arrived: validate it now and close ourselves.
+            // Anything else (no length, trailing bytes, chunked) still waits for the close.
+            if (m_requestSent && !m_attemptRejected && !m_responseCompleted && declaresContentLength(m_wire)) {
+                QByteArray body; QString error;
+                if (parseHttp(m_wire, &body, &error)) completeResponse(attempt, QStringLiteral("content_complete"));
+            }
         });
         connect(socket, &QSslSocket::disconnected, this, [this, attempt] {
             if (m_finished || attempt != m_attempt || m_attemptRejected || m_responseCompleted) return;
-            m_responseCompleted = true;
-            logStage(QStringLiteral("disconnected"));
             // QSslSocket can report RemoteHostClosedError before disconnected.
             // Drain remaining plaintext only after TLS has finished processing
             // the close, then validate the complete response exactly once.
             if (m_socket) m_wire += m_socket->readAll();
-            if (!m_tlsEstablished || m_tlsErrorCount != 0 || m_peerVerifyError != -1) {
-                failAttempt(attempt, "TLS session was not verified"); return;
-            }
-            QByteArray body; QString error; QString egress;
-            m_parseOk = parseHttp(m_wire, &body, &error);
-            QStringList expectedEgress = m_request.expectedEgressIpv4;
-            if (m_parseOk && m_request.acceptAnyPublicEgress) {
-                const QString origin = QJsonDocument::fromJson(body).object().value(QStringLiteral("origin")).toString()
-                                           .section(QLatin1Char(','), 0, 0).trimmed();
-                const QHostAddress address(origin);
-                if (address.protocol() == QAbstractSocket::IPv4Protocol && !address.isPrivateUse() &&
-                    !address.isLoopback() && !address.isLinkLocal()) expectedEgress = {origin};
-            }
-            m_nonceOk = false;
-            m_egressOk = false;
-            if (m_parseOk) {
-                m_nonceOk = responseNonceMatches(body, m_request.nonce, nullptr);
-                m_egressOk = responseEgressMatches(body, expectedEgress, &egress);
-                if (!MayakTunnelProbe::validateResponse(body, m_request.nonce, expectedEgress, &egress, &error)) {
-                    failAttempt(attempt, error); return;
-                }
-            } else {
-                failAttempt(attempt, error); return;
-            }
-            MayakTunnelProbeProof proof;
-            proof.attemptTag = m_request.attemptTag; proof.nonce = m_request.nonce;
-            proof.observedEgressIpv4 = egress; proof.interfaceName = m_request.interfaceName;
-            proof.localAddress = m_request.localAddress.toString(); proof.certificateVerified = true;
-            finish(true, proof, {});
+            completeResponse(attempt, QStringLiteral("disconnected"));
         });
         connect(socket, &QSslSocket::sslErrors, this, [this, attempt](const QList<QSslError> &errors) {
             if (m_finished || attempt != m_attempt) return;
@@ -495,7 +489,7 @@ private:
             // Peer EOF is the expected HTTP Connection: close completion.
             // Retrying here can discard a valid response before disconnected
             // drains the final TLS bytes. Other errors remain fail-closed.
-            if (error == QAbstractSocket::RemoteHostClosedError && m_tlsEstablished) return;
+            if (error == QAbstractSocket::RemoteHostClosedError && m_requestSent) return;
             scheduleRetry(attempt, socketError);
         });
         connect(socket, &QSslSocket::stateChanged, this, [this, attempt](QAbstractSocket::SocketState state) {
@@ -536,11 +530,11 @@ private:
             // No interface binding: the SOCKS entry is loopback; only the race uses this mode.
             logStage(QStringLiteral("connect_requested"), QStringLiteral("via_socks=1"));
 #ifdef MAYAK_TUNNEL_PROBE_TESTING
-            const quint16 socksTargetPort = m_request.testPort ? m_request.testPort : quint16(443);
+            const quint16 socksTargetPort = m_request.testPort ? m_request.testPort : AgentPort;
 #else
-            constexpr quint16 socksTargetPort = 443;
+            constexpr quint16 socksTargetPort = AgentPort;
 #endif
-            m_socket->connectToHostEncrypted(host, socksTargetPort, QIODevice::ReadWrite, QAbstractSocket::AnyIPProtocol);
+            m_socket->connectToHost(host, socksTargetPort, QIODevice::ReadWrite, QAbstractSocket::AnyIPProtocol);
             return;
         }
         // Let Qt create and own the TCP engine. Unlike descriptor adoption,
@@ -641,26 +635,20 @@ private:
         logStage(QStringLiteral("platform_bound"));
         logStage(QStringLiteral("connect_requested"));
 #ifdef MAYAK_TUNNEL_PROBE_TESTING
-        const quint16 port = m_request.testPort ? m_request.testPort : quint16(443);
+        const quint16 port = m_request.testPort ? m_request.testPort : AgentPort;
         if (m_request.testConnectDelayMs > 0) {
             QTimer::singleShot(m_request.testConnectDelayMs, this, [this, attempt, host, port] {
                 if (m_finished || attempt != m_attempt || m_attemptRejected) return;
                 if (!boundIdentityMatches()) { scheduleRetry(attempt, "bound socket identity changed"); return; }
-                m_socket->connectToHostEncrypted(host, port, QIODevice::ReadWrite, QAbstractSocket::IPv4Protocol);
+                m_socket->connectToHost(host, port, QIODevice::ReadWrite, QAbstractSocket::IPv4Protocol);
             });
             return;
         }
 #else
-        constexpr quint16 port = 443;
+        constexpr quint16 port = AgentPort;
 #endif
-        // Keep hostname verification/SNI and async DNS; the bound engine is
-        // IPv4, so Qt must not replace it while selecting another protocol.
-        if (!m_currentIpv4.isEmpty()) {
-            // Split tunneling: connect to the routed address, verify the certificate for host.
-            m_socket->connectToHostEncrypted(m_currentIpv4, port, host, QIODevice::ReadWrite, QAbstractSocket::IPv4Protocol);
-            return;
-        }
-        m_socket->connectToHostEncrypted(host, port, QIODevice::ReadWrite, QAbstractSocket::IPv4Protocol);
+        // An IPv4 literal: no DNS. The bound engine is IPv4, so Qt must not replace it.
+        m_socket->connectToHost(host, port, QIODevice::ReadWrite, QAbstractSocket::IPv4Protocol);
     }
 
     bool interfaceIdentityMatches() const {
@@ -718,26 +706,12 @@ private:
 #endif
     }
 
-    int hostCount() const {
-#ifdef MAYAK_TUNNEL_PROBE_TESTING
-        if (!m_request.testHost.isEmpty()) return 1;
-#endif
-        if (!m_request.pinnedEndpoints.isEmpty()) return int(m_request.pinnedEndpoints.size());
-        return Hosts.size();
-    }
-    QString hostAt(int index) const {
+    int hostCount() const { return 1; }
+    QString hostAt(int) const {
 #ifdef MAYAK_TUNNEL_PROBE_TESTING
         if (!m_request.testHost.isEmpty()) return m_request.testHost;
 #endif
-        if (!m_request.pinnedEndpoints.isEmpty()) return m_request.pinnedEndpoints.at(index).host;
-        return Hosts.at(index);
-    }
-    QString pinnedIpv4At(int index) const {
-#ifdef MAYAK_TUNNEL_PROBE_TESTING
-        if (!m_request.testHost.isEmpty()) return {};
-#endif
-        if (index < 0 || index >= m_request.pinnedEndpoints.size()) return {};
-        return m_request.pinnedEndpoints.at(index).ipv4;
+        return AgentHost;
     }
 
     QPointer<MayakTunnelProbe> m_owner;
@@ -749,7 +723,6 @@ private:
     QByteArray m_wire;
     int m_hostIndex = 0;
     QString m_currentHost;
-    QString m_currentIpv4;
 #ifdef MAYAK_TUNNEL_PROBE_TESTING
     int m_testSourceBindFailures = m_request.testSourceBindFailures;
     bool m_testIdentityDriftDuringBindWait = false;
@@ -784,8 +757,8 @@ private:
     bool m_attemptRejected = false;
     bool m_responseCompleted = false;
     bool m_parseOk = false;
-    bool m_nonceOk = false;
-    bool m_egressOk = false;
+    bool m_agentOk = false;
+    bool m_requestSent = false;
 };
 
 quint64 MayakTunnelProbe::start(const MayakTunnelProbeRequest &request) {
@@ -803,22 +776,21 @@ void MayakTunnelProbe::cancel() {
     m_run.clear();
 }
 
-bool MayakTunnelProbe::validateResponse(const QByteArray &body, const QString &nonce,
-                                        const QStringList &expected, QString *observed, QString *error) {
+bool MayakTunnelProbe::validateAgentResponse(const QByteArray &body, const QString &nonce,
+                                             const QString &expectedExitId, QString *observedExitId, QString *error) {
     QJsonParseError parseError{};
     if (!JsonObjectKeyScanner(body).hasUniqueKeys()) { *error = "duplicate or malformed JSON object key"; return false; }
     const auto doc = QJsonDocument::fromJson(body, &parseError);
     if (parseError.error != QJsonParseError::NoError || !doc.isObject()) { *error = "invalid JSON response"; return false; }
     const QJsonObject obj = doc.object();
-    const auto args = obj.value("args");
-    const auto nonceValue = args.isObject() ? args.toObject().value("mayak_nonce") : QJsonValue();
-    QString returnedNonce;
-    if (nonceValue.isString()) returnedNonce = nonceValue.toString();
-    else if (nonceValue.isArray() && nonceValue.toArray().size() == 1 && nonceValue.toArray().first().isString()) returnedNonce = nonceValue.toArray().first().toString();
-    if (returnedNonce != nonce) { *error = "nonce mismatch"; return false; }
-    const QString origin = obj.value("origin").toString();
-    const QString first = origin.section(',', 0, 0).trimmed();
-    if (!validIpv4(first) || !expected.contains(first)) { *error = "unexpected or invalid observed egress"; return false; }
-    if (observed) *observed = first;
+    if (obj.size() != 3 || !obj.value("v").isDouble() || obj.value("v").toDouble() != 1.0 ||
+        !obj.value("exit").isString() || !obj.value("nonce").isString()) { *error = "unexpected agent answer"; return false; }
+    if (nonce.isEmpty() || obj.value("nonce").toString() != nonce) { *error = "nonce mismatch"; return false; }
+    // Guid text: compared without case; the proof carries the id exactly as the gateway gave it.
+    const QString exitId = obj.value("exit").toString();
+    if (expectedExitId.isEmpty() || exitId.compare(expectedExitId, Qt::CaseInsensitive) != 0) {
+        *error = "another exit answered"; return false;
+    }
+    if (observedExitId) *observedExitId = expectedExitId;
     return true;
 }
