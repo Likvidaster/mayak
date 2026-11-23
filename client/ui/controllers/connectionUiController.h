@@ -2,6 +2,7 @@
 #define CONNECTIONUICONTROLLER_H
 
 #include <QObject>
+#include <QVariantMap>
 
 #include "core/controllers/connectionController.h"
 #include "core/utils/errorCodes.h"
@@ -18,6 +19,10 @@ public:
     Q_PROPERTY(bool isConnected READ isConnected NOTIFY connectionStateChanged)
     Q_PROPERTY(bool isConnectionInProgress READ isConnectionInProgress NOTIFY connectionStateChanged)
     Q_PROPERTY(QString connectionStateText READ connectionStateText NOTIFY connectionStateChanged)
+    Q_PROPERTY(QString connectionPhase READ connectionPhase NOTIFY connectionStateChanged)
+    Q_PROPERTY(bool cleanupPending READ cleanupPending NOTIFY connectionStateChanged)
+    Q_PROPERTY(QVariantMap exitLocation READ exitLocation NOTIFY connectionStateChanged)
+    Q_PROPERTY(QVariantMap route READ route NOTIFY connectionStateChanged)
 
     explicit ConnectionUiController(ConnectionController* connectionController,
                                     ServersController* serversController,
@@ -28,6 +33,10 @@ public:
     bool isConnected() const;
     bool isConnectionInProgress() const;
     QString connectionStateText() const;
+    QString connectionPhase() const;
+    bool cleanupPending() const;
+    QVariantMap exitLocation() const;
+    QVariantMap route() const;
 
 public slots:
     void toggleConnection();
@@ -42,6 +51,10 @@ public slots:
 
     void onTranslationsUpdated();
 
+    // Mayak (Windows): answers to the "another VPN is on" question.
+    void stopForeignVpnAndConnect();
+    void connectDespiteForeignVpn();
+
 signals:
     void connectionStateChanged();
 
@@ -52,6 +65,9 @@ signals:
     void prepareConfig();
     void unsupportedConnectDrawerRequested();
     void noInstalledContainers();
+
+    void foreignVpnDetected(const QString &program, bool stoppable);
+    void foreignVpnStopFailed(const QString &program);
 
 private:
     Vpn::ConnectionState getCurrentConnectionState();
@@ -65,6 +81,9 @@ private:
     QString m_connectionStateText = tr("Connect");
 
     Vpn::ConnectionState m_state;
+
+    QString m_foreignProgram;
+    bool m_foreignStopInFlight = false;
 };
 
 #endif

@@ -210,6 +210,41 @@ void SecureAppSettingsRepository::setSitesSplitTunnelingEnabled(bool enabled)
     emit sitesSplitTunnelingEnabledChanged(enabled);
 }
 
+QString SecureAppSettingsRepository::mayakConnectionMethod() const
+{
+    const QString method = value("Conf/mayakConnectionMethod", QStringLiteral("auto")).toString();
+    return method == QStringLiteral("awg") || method == QStringLiteral("xray") ? method : QStringLiteral("auto");
+}
+
+void SecureAppSettingsRepository::setMayakConnectionMethod(const QString &method)
+{
+    const QString normalized = method == QStringLiteral("awg") || method == QStringLiteral("xray") ? method : QStringLiteral("auto");
+    if (normalized == mayakConnectionMethod()) return;
+    setValue("Conf/mayakConnectionMethod", normalized);
+    emit mayakConnectionMethodChanged(normalized);
+}
+
+bool SecureAppSettingsRepository::isMayakRussiaDirectEnabled() const
+{
+    return value("Conf/mayakRussiaDirect", true).toBool();
+}
+
+void SecureAppSettingsRepository::setMayakRussiaDirectEnabled(bool enabled)
+{
+    setValue("Conf/mayakRussiaDirect", enabled);
+    emit mayakRussiaDirectEnabledChanged(enabled);
+}
+
+bool SecureAppSettingsRepository::isMayakRussiaDirectNoticeShown() const
+{
+    return value("Conf/mayakRussiaDirectNoticeShown", false).toBool();
+}
+
+void SecureAppSettingsRepository::setMayakRussiaDirectNoticeShown(bool shown)
+{
+    setValue("Conf/mayakRussiaDirectNoticeShown", shown);
+}
+
 namespace {
     QString appsRouteModeString(AppsRouteMode mode) {
         switch (mode) {
@@ -460,6 +495,32 @@ void SecureAppSettingsRepository::setAutoUpdateCheckEnabled(bool enabled)
     setValue("Conf/autoUpdateCheck", enabled);
 }
 
+bool SecureAppSettingsRepository::isMayakAutoUpdateEnabled() const
+{
+    return value("Conf/mayakAutoUpdate", true).toBool();
+}
+
+void SecureAppSettingsRepository::setMayakAutoUpdateEnabled(bool enabled)
+{
+    setValue("Conf/mayakAutoUpdate", enabled);
+}
+
+QString SecureAppSettingsRepository::mayakAutoUpdateScheduledVersion() const
+{
+    return value("Conf/mayakAutoUpdateScheduledVersion").toString();
+}
+
+QDateTime SecureAppSettingsRepository::mayakAutoUpdateScheduledAt() const
+{
+    return value("Conf/mayakAutoUpdateScheduledAt").toDateTime();
+}
+
+void SecureAppSettingsRepository::setMayakAutoUpdateScheduled(const QString &version, const QDateTime &at)
+{
+    setValue("Conf/mayakAutoUpdateScheduledVersion", version);
+    setValue("Conf/mayakAutoUpdateScheduledAt", at);
+}
+
 bool SecureAppSettingsRepository::isSaveLogs() const
 {
     return value("Conf/saveLogs", false).toBool();
@@ -495,6 +556,64 @@ QString SecureAppSettingsRepository::getInstallationUuid(bool createIfNotExists)
         const_cast<SecureAppSettingsRepository*>(this)->setValue("Conf/installationUuid", uuid);
     }
     return uuid;
+}
+
+QString SecureAppSettingsRepository::mayakSessionToken() const
+{
+    if (!m_settings->encryptedStorageAvailable() || !m_settings->isEncryptedValueStored(QStringLiteral("Mayak/sessionToken"))) {
+        return {};
+    }
+    return value(QStringLiteral("Mayak/sessionToken")).toString();
+}
+
+bool SecureAppSettingsRepository::setMayakSessionToken(const QString &token)
+{
+    if (!mayakSessionToken().isEmpty() && mayakSessionToken() != token) emit mayakSessionChanging();
+    const QString key = QStringLiteral("Mayak/sessionToken");
+    if (token.isEmpty()) {
+        return m_settings->removeAndSync(key);
+    }
+    if (!m_settings->encryptedStorageAvailable()) {
+        return false;
+    }
+    return m_settings->setEncryptedValueAndSync(key, token);
+}
+
+bool SecureAppSettingsRepository::isMayakManagedServer(const QString &id) const
+{
+    return !id.isEmpty() && value(QStringLiteral("Mayak/managedServers")).toStringList().contains(id);
+}
+
+QString SecureAppSettingsRepository::mayakServerForDevice(const QString &deviceId) const
+{
+    if (deviceId.isEmpty()) return {};
+    return value(QStringLiteral("Mayak/deviceServers")).toMap().value(deviceId).toString();
+}
+
+void SecureAppSettingsRepository::setMayakServerForDevice(const QString &deviceId, const QString &serverId)
+{
+    if (deviceId.isEmpty() || serverId.isEmpty()) return;
+    QVariantMap map = value(QStringLiteral("Mayak/deviceServers")).toMap();
+    // У одного сервера в списке — одно устройство: прежняя запись для этого сервера снимается.
+    for (auto it = map.begin(); it != map.end();) {
+        if (it.value().toString() == serverId && it.key() != deviceId) it = map.erase(it);
+        else ++it;
+    }
+    map.insert(deviceId, serverId);
+    setValue(QStringLiteral("Mayak/deviceServers"), map);
+}
+
+bool SecureAppSettingsRepository::hasMayakDeviceServers() const
+{
+    return !value(QStringLiteral("Mayak/deviceServers")).toMap().isEmpty();
+}
+
+bool SecureAppSettingsRepository::markMayakManagedServer(const QString &id)
+{
+    if (id.isEmpty()) return false;
+    auto ids = value(QStringLiteral("Mayak/managedServers")).toStringList();
+    if (!ids.contains(id)) ids.append(id);
+    return m_settings->setEncryptedValueAndSync(QStringLiteral("Mayak/managedServers"), ids);
 }
 
 QStringList SecureAppSettingsRepository::getReadNewsIds() const

@@ -83,10 +83,12 @@ qt6_add_resources(QRC ${QRC}
     ${CMAKE_CURRENT_LIST_DIR}/images/images.qrc
     ${CMAKE_CURRENT_LIST_DIR}/images/flagKit.qrc
     ${CMAKE_CURRENT_LIST_DIR}/resources/countries.qrc
+    ${CMAKE_CURRENT_LIST_DIR}/resources/mayakRoutes.qrc
     ${CMAKE_CURRENT_LIST_DIR}/client_scripts/clientScripts.qrc
     ${CLIENT_QML_QRC_FILE}
     ${CMAKE_CURRENT_LIST_DIR}/server_scripts/serverScripts.qrc
     ${CLIENT_EXTRA_QRC}
+    ${CMAKE_SOURCE_DIR}/mayak/update_signing_key.qrc
 )
 
 # -- i18n begin
@@ -199,6 +201,10 @@ if(WIN32)
     )
 
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
+    # Mayak: without WIN32_EXECUTABLE CMake appends /subsystem:console after the
+    # flags above, the console flag wins, and Windows opens a cmd window with the
+    # app (closing that window kills the app). The GUI client must be a GUI exe.
+    set_target_properties(${PROJECT} PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 
 if(APPLE)

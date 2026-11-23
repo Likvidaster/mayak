@@ -19,6 +19,12 @@
     <!-- %%INSERT_FEATURES -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Mayak 5.1.0.27: the pending update install job survives a reboot (JobInfo.setPersisted). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Mayak automatic update: let the app's own install session update it without asking (Android 12+). -->
+    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
     <!-- To request network state -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
@@ -68,7 +74,54 @@
                 android:name="android.app.lib_name"
                 android:value="-- %%INSERT_APP_LIB_NAME%% --" />
 
+            <meta-data
+                android:name="android.app.background_running"
+                android:value="true" />
+
         </activity>
+
+        <!-- Mayak: invisible tile/notification "Connect" trampoline (main process, no UI). -->
+        <activity
+            android:name=".MayakConnectActivity"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:exported="false"
+            android:theme="@android:style/Theme.NoDisplay" />
+
+        <!-- Mayak: service watchdog -> app (main process): current exit unreachable, reconnect. -->
+        <receiver
+            android:name=".MayakFailoverReceiver"
+            android:exported="false" />
+
+        <!-- Mayak automatic update: restart the running AWG tunnel right after the update
+             (MY_PACKAGE_REPLACED is a protected broadcast: only the system sends it). -->
+        <receiver
+            android:name=".MayakUpdateReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Mayak automatic update: results of the app's own install session. -->
+        <receiver
+            android:name=".MayakUpdateStatusReceiver"
+            android:exported="false" />
+
+        <!-- Mayak automatic update (Android 13 and older): install in an idle window. -->
+        <service
+            android:name=".MayakUpdateJob"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false" />
+
+        <!-- Mayak automatic update: download on an unmetered network in its own process (the app's
+             process is frozen in the background). -->
+        <service
+            android:name=".MayakUpdateDownloadJob"
+            android:process=":mayakUpdate"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false" />
 
         <activity
             android:name=".CameraActivity"

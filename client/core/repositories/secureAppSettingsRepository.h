@@ -57,6 +57,16 @@ public:
     bool isAppsSplitTunnelingEnabled() const;
     void setAppsSplitTunnelingEnabled(bool enabled);
 
+    // Mayak «Россия напрямую»: on by default until the user chooses; the choice is stored and
+    // survives updates (only a missing key means "not chosen yet").
+    // Mayak 5.1.0.21: "auto" (AWG, then Xray paths), "awg" or "xray" (owner checks).
+    QString mayakConnectionMethod() const;
+    void setMayakConnectionMethod(const QString &method);
+    bool isMayakRussiaDirectEnabled() const;
+    void setMayakRussiaDirectEnabled(bool enabled);
+    bool isMayakRussiaDirectNoticeShown() const;
+    void setMayakRussiaDirectNoticeShown(bool shown);
+
     QString getGatewayEndpoint(bool isTestPurchase = false) const;
     void setGatewayEndpoint(const QString &endpoint);
     void resetGatewayEndpoint();
@@ -89,12 +99,28 @@ public:
 
     bool isAutoUpdateCheckEnabled() const;
     void setAutoUpdateCheckEnabled(bool enabled);
+    // Mayak: download and install updates by themselves (default on, owner 20.11.2026).
+    bool isMayakAutoUpdateEnabled() const;
+    void setMayakAutoUpdateEnabled(bool enabled);
+    // The version whose background install was last handed to the system (and when).
+    QString mayakAutoUpdateScheduledVersion() const;
+    QDateTime mayakAutoUpdateScheduledAt() const;
+    void setMayakAutoUpdateScheduled(const QString &version, const QDateTime &at);
     bool isSaveLogs() const;
     void setSaveLogs(bool enabled);
     QDateTime getLogEnableDate() const;
     void setLogEnableDate(const QDateTime &date);
     
     QString getInstallationUuid(bool createIfNotExists) const;
+    QString mayakSessionToken() const;
+    bool setMayakSessionToken(const QString &token);
+    bool isMayakManagedServer(const QString &serverId) const;
+    bool markMayakManagedServer(const QString &serverId);
+    // Какой сервер Маяка в списке принадлежит устройству аккаунта (deviceId с сервера): при входе в другой аккаунт
+    // и обратно ключ меняется на месте только у «своей» подписки.
+    QString mayakServerForDevice(const QString &deviceId) const;
+    void setMayakServerForDevice(const QString &deviceId, const QString &serverId);
+    bool hasMayakDeviceServers() const;
     QStringList getReadNewsIds() const;
     void setReadNewsIds(const QStringList &ids);
 
@@ -115,6 +141,7 @@ public:
     void setLocalProxyPortUserDefined(bool userDefined);
 
 signals:
+    void mayakSessionChanging();
     void appLanguageChanged(QLocale locale);
     void allowedDnsServersChanged(const QStringList &servers);
     void sitesChanged(RouteMode mode);
@@ -123,6 +150,8 @@ signals:
     void appsRouteModeChanged(AppsRouteMode mode);
     void sitesSplitTunnelingEnabledChanged(bool enabled);
     void appsSplitTunnelingEnabledChanged(bool enabled);
+    void mayakRussiaDirectEnabledChanged(bool enabled);
+    void mayakConnectionMethodChanged(const QString &method);
     void useAmneziaDnsChanged(bool enabled);
     void saveLogsChanged(bool enabled);
     void screenshotsEnabledChanged(bool enabled);

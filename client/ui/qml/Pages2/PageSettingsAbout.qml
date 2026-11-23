@@ -54,7 +54,7 @@ PageType {
                 Layout.preferredWidth: 153
                 Layout.preferredHeight: 131
 
-                source: "qrc:/images/amneziaLogo.svg"
+                source: "qrc:/images/mayak-mark-round-128.png"
                 sourceSize: Qt.size(153 * Screen.devicePixelRatio, 131 * Screen.devicePixelRatio)
                 fillMode: Image.PreserveAspectFit
             }
@@ -66,7 +66,7 @@ PageType {
                 Layout.rightMargin: 16
 
                 horizontalAlignment: Text.AlignHCenter
-                text: qsTr("Support Amnezia")
+                text: qsTr("Маяк VPN")
             }
 
             BodyTextType {
@@ -76,8 +76,9 @@ PageType {
                 Layout.rightMargin: 16
 
                 horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
                 color: AmneziaStyle.color.textSecondary
-                text: qsTr("Amnezia is a free and open-source application. You can support the developers if you like it.")
+                text: qsTr("Видно далеко. Приложение с открытым исходным кодом, основано на AmneziaVPN (GPLv3).")
             }
 
             ColumnLayout {
@@ -98,7 +99,7 @@ PageType {
                         Layout.fillWidth: true
 
                         color: AmneziaStyle.color.textTertiary
-                        text: qsTr("Contacts")
+                        text: qsTr("Маяк в сети")
                     }
 
                     ColumnLayout {
@@ -109,51 +110,34 @@ PageType {
                         ListItemType {
                             Layout.fillWidth: true
 
-                            text: qsTr("Telegram group")
-                            subtitle: qsTr("To discuss features")
-                            icon.source: "qrc:/images/controls/telegram.svg"
-
-                            onClicked: Qt.openUrlExternally(qsTr("https://telegram.me/amnezia_vpn_en"))
-                        }
-
-                        ListItemType {
-                            Layout.fillWidth: true
-
-                            text: qsTr("Amnezia Hub Telegram Bot")
-                            subtitle: qsTr("Ask us anything")
-                            icon.source: "qrc:/images/controls/telegram.svg"
-
-                            onClicked: Qt.openUrlExternally("https://telegram.me/amneziahub_bot?start=utm_ioIdiSEUDN")
-                        }
-
-                        ListItemType {
-                            Layout.fillWidth: true
-
-                            text: qsTr("support@amnezia.org")
-                            subtitle: qsTr("For reviews and bug reports")
-                            icon.source: "qrc:/images/controls/mail.svg"
-
-                            onClicked: Qt.openUrlExternally(qsTr("mailto:support@amnezia.org"))
-                        }
-
-                        ListItemType {
-                            Layout.fillWidth: true
-
-                            text: qsTr("GitHub")
-                            subtitle: qsTr("Discover the source code")
-                            icon.source: "qrc:/images/controls/github.svg"
-
-                            onClicked: Qt.openUrlExternally(qsTr("https://github.com/amnezia-vpn/amnezia-client"))
-                        }
-
-                        ListItemType {
-                            Layout.fillWidth: true
-
-                            text: qsTr("Website")
-                            subtitle: qsTr("Visit official website")
-                            icon.source: "qrc:/images/controls/amnezia.svg"
+                            text: qsTr("Сайт Маяка")
+                            subtitle: qsTr("mayaklight.ru · загрузки и инструкции")
+                            icon.source: "qrc:/images/controls/globe-2.svg"
+                            trailingIconSource: "qrc:/images/controls/external-link.svg"
 
                             onClicked: Qt.openUrlExternally(LanguageUiController.getCurrentSiteUrl())
+                        }
+
+                        ListItemType {
+                            Layout.fillWidth: true
+
+                            text: qsTr("Личный кабинет")
+                            subtitle: qsTr("Аккаунт, устройства и приглашения")
+                            icon.source: "qrc:/images/controls/smartphone.svg"
+                            trailingIconSource: "qrc:/images/controls/external-link.svg"
+
+                            onClicked: Qt.openUrlExternally(LanguageUiController.getCurrentSiteUrl("my/"))
+                        }
+
+                        ListItemType {
+                            Layout.fillWidth: true
+
+                            text: qsTr("Исходный код")
+                            subtitle: qsTr("Маяк на GitHub, лицензия GPLv3")
+                            icon.source: "qrc:/images/controls/github.svg"
+                            trailingIconSource: "qrc:/images/controls/external-link.svg"
+
+                            onClicked: Qt.openUrlExternally("https://github.com/Likvidaster/mayak")
                         }
                     }
                 }
@@ -171,6 +155,8 @@ PageType {
 
                         CaptionTextType {
                             text: SettingsController.getAppVersion()
+                            font.family: AmneziaStyle.monoFontFamily
+                            font.pixelSize: 13
 
                             MouseArea {
                                 property int clickCount: 0
@@ -206,13 +192,21 @@ PageType {
                         variant: ButtonType.Text
                         size: ButtonType.Medium
                         loading: UpdateController.isCheckRunning
-                        enabled: !UpdateController.isCheckRunning
+                        enabled: UpdateController.isUpdateSupported && !UpdateController.isCheckRunning
 
                         text: UpdateController.isCheckRunning ? qsTr("Checking...") : qsTr("Check for updates")
 
                         onClicked: {
                             UpdateController.checkForUpdates()
                         }
+                    }
+
+                    BodyTextType {
+                        Layout.fillWidth: true
+                        visible: !UpdateController.isUpdateSupported
+                        horizontalAlignment: Text.AlignHCenter
+                        color: AmneziaStyle.color.textTertiary
+                        text: qsTr("Для этой архитектуры устройства обновления недоступны.")
                     }
 
                     ButtonType {
@@ -222,10 +216,10 @@ PageType {
 
                         variant: ButtonType.Text
                         size: ButtonType.Medium
-                        text: qsTr("Privacy Policy")
+                        text: qsTr("Политика конфиденциальности")
 
                         onClicked: {
-                            Qt.openUrlExternally(LanguageUiController.getCurrentSiteUrl("policy"))
+                            Qt.openUrlExternally(LanguageUiController.getCurrentSiteUrl("privacy/"))
                         }
                     }
                 }

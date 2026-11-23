@@ -66,6 +66,8 @@ private:
     QCommandLineOption m_optCleanup;
     QCommandLineOption m_optConnect;
     QCommandLineOption m_optImport;
+    QCommandLineOption m_optAfterUpdate; // Mayak: restarted by the update guard
+    QCommandLineOption m_optReconnect;   // Mayak: the VPN was on before the update
 
     QSharedPointer<VpnConnection> m_vpnConnection;
     QThread m_vpnConnectionThread;

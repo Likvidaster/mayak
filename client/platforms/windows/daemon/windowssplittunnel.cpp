@@ -120,7 +120,7 @@ using ProcessInfo = struct {
 
 constexpr static const auto DRIVER_SYMLINK = L"\\\\.\\MULLVADSPLITTUNNEL";
 constexpr static const auto DRIVER_FILENAME = "mullvad-split-tunnel.sys";
-constexpr static const auto DRIVER_SERVICE_NAME = L"AmneziaVPNSplitTunnel";
+constexpr static const auto DRIVER_SERVICE_NAME = L"MayakVPNSplitTunnel";
 constexpr static const auto MV_SERVICE_NAME = L"MullvadVPN";
 
 #pragma endregion
@@ -239,6 +239,7 @@ std::unique_ptr<WindowsSplitTunnel> WindowsSplitTunnel::create(
   }
   if (!initDriver(driverFile)) {
     logger.error() << "Failed to init driver";
+    CloseHandle(driverFile); // Mayak: the exclusive handle would block every later attempt
     return nullptr;
   }
   // We're ready to talk to the driver, it's alive and setup.
@@ -378,15 +379,16 @@ bool WindowsSplitTunnel::start(int inetAdapterIndex, int vpnAdapterIndex) {
   return true;
 }
 
-void WindowsSplitTunnel::stop() {
-  DWORD bytesReturned;
+bool WindowsSplitTunnel::stop() {
+  DWORD bytesReturned = 0;
   auto ok = DeviceIoControl(m_driver, IOCTL_CLEAR_CONFIGURATION, nullptr, 0,
                             nullptr, 0, &bytesReturned, nullptr);
   if (!ok) {
     logger.error() << "Stopping Split tunnel not successfull";
-    return;
+    return false;
   }
   logger.debug() << "Stopping Split tunnel successfull";
+  return true;
 }
 
 bool WindowsSplitTunnel::resetDriver(HANDLE driverIO) {
@@ -618,7 +620,7 @@ std::vector<uint8_t> WindowsSplitTunnel::generateProcessBlob() {
 
 // static
 SC_HANDLE WindowsSplitTunnel::installDriver() {
-  LPCWSTR displayName = L"Amnezia Split Tunnel Service";
+  LPCWSTR displayName = L"Mayak Split Tunnel Service";
   QFileInfo driver(qApp->applicationDirPath() + "/" + DRIVER_FILENAME);
   if (!driver.exists()) {
     logger.error() << "Split Tunnel Driver File not found "

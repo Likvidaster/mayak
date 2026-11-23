@@ -7,6 +7,9 @@
 
 #include <QDateTime>
 #include <QTimer>
+#ifdef Q_OS_WINDOWS
+#include <optional>
+#endif
 
 #include "daemon/daemonerrors.h"
 #include "daemonerrors.h"
@@ -33,8 +36,15 @@ class Daemon : public QObject {
   static bool parseConfig(const QJsonObject& obj, InterfaceConfig& config);
 
   virtual bool activate(const InterfaceConfig& config);
+  // Only commit the supplied context after actual backend activation succeeds.
+  bool activateWithHealthContext(const InterfaceConfig& config, const QString& contextId);
+  QString activeHealthContextId() const { return m_healthContextId; }
   virtual bool deactivate(bool emitSignals = true);
+  bool managedDeactivate(const QString& controlIdentity);
+  QJsonObject managedInspection();
   virtual QJsonObject getStatus();
+  // Mayak: make app exclusions usable before a connect ("ok" or a reason). Only Windows needs it.
+  virtual QString mayakPrepareSplitTunnel() { return QStringLiteral("ok"); }
 
   // Callback before any Activating measure is done
   virtual void prepareActivation(const InterfaceConfig& config, int inetAdapterIndex = 0) {
@@ -57,6 +67,9 @@ class Daemon : public QObject {
 
  private:
   bool maybeUpdateResolvers(const InterfaceConfig& config);
+#ifdef Q_OS_WINDOWS
+  bool cleanupWindowsManagedActivation();
+#endif
   bool addExclusionRoute(const IPAddress& address);
   bool delExclusionRoute(const IPAddress& address);
 
@@ -88,6 +101,19 @@ class Daemon : public QObject {
   QMap<InterfaceConfig::HopType, ConnectionState> m_connections;
   QHash<IPAddress, int> m_excludedAddrSet;
   QTimer m_handshakeTimer;
+#ifdef Q_OS_WINDOWS
+  bool m_windowsManagedActivation = false;
+  std::optional<InterfaceConfig> m_windowsCleanupConfig;
+  bool m_windowsInterfaceAttempted = false;
+  bool m_windowsDnsAttempted = false;
+  bool m_windowsUpAttempted = false;
+  QString m_windowsLastStoppedIdentity;
+#endif
+  QString m_healthContextId;
+  QString m_controlIdentity;
+  bool m_teardownUncertain = false;
+  quint64 m_healthGeneration = 0;
+  InterfaceConfig::HopType m_healthHopType = InterfaceConfig::SingleHop;
 };
 
 #endif  // DAEMON_H

@@ -27,6 +27,8 @@ public:
     virtual ~NotificationHandler();
 
     void unsecuredNetworkNotification(const QString& networkName);
+    // Mayak: a plain information message (automatic update).
+    void mayakInfo(const QString& title, const QString& message) { notify(VpnState, title, message, 8000); }
 
     void messageClickHandle();
 

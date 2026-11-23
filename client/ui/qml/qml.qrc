@@ -10,6 +10,28 @@
         <file>Components/UpdateSupportDrawer.qml</file>
         <file>Components/PromoBanner.qml</file>
         <file>Components/ConnectButton.qml</file>
+        <file>MayakCity/MayakCity.js</file>
+        <file>MayakCity/MayakCityScene.qml</file>
+        <file>MayakCity/icons/sun.svg</file>
+        <file>MayakCity/icons/moon.svg</file>
+        <file>MayakCity/icons/sun-day.svg</file>
+        <file>MayakCity/icons/moon-day.svg</file>
+        <file>MayakCity/icons/gear.svg</file>
+        <file>MayakCity/icons/gear-day.svg</file>
+        <file>MayakCity/oslo.jpg</file>
+        <file>MayakCity/helsinki.jpg</file>
+        <file>MayakCity/amsterdam.jpg</file>
+        <file>MayakCity/frankfurt.jpg</file>
+        <file>MayakCity/stockholm.jpg</file>
+        <file>newComponents/Mayak/qmldir</file>
+        <file>newComponents/Mayak/MayakBeacon.qml</file>
+        <file>newComponents/Mayak/assets/f7-layer-sky.svg</file>
+        <file>newComponents/Mayak/assets/f7-layer-land-tower.svg</file>
+        <file>newComponents/Mayak/assets/f7-layer-sky-day.svg</file>
+        <file>newComponents/Mayak/assets/f7-layer-land-tower-day.svg</file>
+        <file>newComponents/Mayak/assets/mayak-f7-small-on.svg</file>
+                <file alias="fonts/Onest.ttf">../../fonts/Mayak/Onest.ttf</file>
+        <file alias="fonts/JetBrainsMono-Regular.ttf">../../fonts/Mayak/JetBrainsMono-Regular.ttf</file>
         <file>Components/CountryListStickyHeader.qml</file>
         <file>Components/CountrySearchRow.qml</file>
         <file>Components/CountrySectionHeader.qml</file>
@@ -23,6 +45,7 @@
         <file>Components/HomeSplitTunnelingDrawer.qml</file>
         <file>Components/InstalledAppsDrawer.qml</file>
         <file>Components/QuestionDrawer.qml</file>
+        <file>Components/MayakUpdatePrompt.qml</file>
         <file>Components/SelectLanguageDrawer.qml</file>
         <file>Components/ServersListView.qml</file>
         <file>Components/SettingsContainersListView.qml</file>
@@ -160,6 +183,7 @@
         <file>Pages2/PageSettingsNewsNotifications.qml</file>
         <file>Pages2/PageSettingsNewsDetail.qml</file>
         <file>Pages2/PageUpdate.qml</file>
+        <file>Pages2/PageMayakInvite.qml</file>
         <file>Pages2/PageProtocolAwgClientSettings.qml</file>
         <file>Pages2/PageProtocolWireGuardClientSettings.qml</file>
         <file>Pages2/PageSetupWizardApiFreeInfo.qml</file>

@@ -34,13 +34,15 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.amnezia.vpn.protocol.BadConfigException
+import org.amnezia.vpn.protocol.Protocol
 import org.amnezia.vpn.protocol.ProtocolState.CONNECTED
 import org.amnezia.vpn.protocol.ProtocolState.CONNECTING
 import org.amnezia.vpn.protocol.ProtocolState.DISCONNECTED
@@ -49,6 +51,8 @@ import org.amnezia.vpn.protocol.ProtocolState.RECONNECTING
 import org.amnezia.vpn.protocol.ProtocolState.UNKNOWN
 import org.amnezia.vpn.protocol.VpnException
 import org.amnezia.vpn.protocol.VpnStartException
+import org.amnezia.vpn.protocol.wireguard.Wireguard
+import org.amnezia.vpn.protocol.xray.Xray
 import org.amnezia.vpn.protocol.putStatus
 import org.amnezia.vpn.util.LoadLibraryException
 import org.amnezia.vpn.util.Log
@@ -67,6 +71,13 @@ const val MSG_VPN_CONFIG = "VPN_CONFIG"
 const val MSG_ERROR = "ERROR"
 const val MSG_SAVE_LOGS = "SAVE_LOGS"
 const val MSG_CLIENT_NAME = "CLIENT_NAME"
+const val MSG_AWG_TUNNEL_HEALTH = "AWG_TUNNEL_HEALTH"
+// Mayak Xray path health: Xray.kt's VPN address (XrayConfig.DEFAULT_IPV4_ADDRESS) and a fixed peer tag.
+private const val XRAY_LOCAL_ADDRESS = "10.0.42.2"
+private const val XRAY_HEALTH_PEER = "78726179"
+const val MSG_MANAGED_RESULT = "MANAGED_RESULT"
+const val MSG_MANAGED_TICKET = "MANAGED_TICKET"
+const val MSG_HEALTH_CONTEXT_ID = "HEALTH_CONTEXT_ID"
 
 const val AFTER_PERMISSION_CHECK = "AFTER_PERMISSION_CHECK"
 private const val PREFS_CONFIG_KEY = "LAST_CONF"
@@ -74,7 +85,22 @@ private const val PREFS_SERVER_NAME = "LAST_SERVER_NAME"
 private const val PREFS_SERVER_INDEX = "LAST_SERVER_INDEX"
 // private const val STATISTICS_SENDING_TIMEOUT = 1000L
 private const val TRAFFIC_STATS_UPDATE_TIMEOUT = 1000L
+private const val STATUS_HEALTH_UPDATE_TIMEOUT = 1000L
+// Mayak service-side watchdog (runs only while the Activity is hidden/frozen or gone).
+private const val WATCHDOG_TICK_MS = 1000L
+private const val WATCHDOG_RECENT_NETWORK_MS = 20_000L
+private const val WATCHDOG_RX_STALE_AFTER_NETWORK_MS = 8_000L
+private const val WATCHDOG_RX_STALE_MS = 20_000L
+private const val WATCHDOG_HANDSHAKE_AGE_MS = 140_000L
+private const val WATCHDOG_NO_HANDSHAKE_MS = 25_000L
+private val WATCHDOG_BACKOFF_MS = longArrayOf(10_000L, 30_000L, 60_000L)
+private const val WATCHDOG_NETWORK_LOST_EXPIRY_MS = 60_000L
+private const val HIDDEN_CONNECT_HEALTH_MS = 30_000L
+private const val WATCHDOG_FAILOVER_AFTER_ATTEMPTS = 2
+private const val WATCHDOG_FAILOVER_REPEAT_MS = 120_000L
 private const val DISCONNECT_TIMEOUT = 5000L
+// Mayak: a tunnel restarted after an app update must be up (AWG handshake) within this time.
+private const val RESUME_PROOF_MS = 30_000L
 private const val STOP_SERVICE_TIMEOUT = 5000L
 
 @SuppressLint("Registered")
@@ -84,7 +110,13 @@ open class AmneziaVpnService : VpnService() {
     private lateinit var connectionScope: CoroutineScope
     private var isServiceBound = false
     private var vpnProto: VpnProto? = null
-    private var protocolState = MutableStateFlow(UNKNOWN)
+    private class ConnectionSession(
+        val source: ManagedProtocolState<org.amnezia.vpn.protocol.ProtocolState>,
+        val protocol: Protocol?
+    )
+    @Volatile private var activeSession = ConnectionSession(ManagedProtocolState("", "", UNKNOWN), null)
+    private val protocolState get() = activeSession.source.state
+    private var protocolStateJob: Job? = null
     private var serverName: String? = null
     private var serverIndex: Int = -1
 
@@ -97,11 +129,35 @@ open class AmneziaVpnService : VpnService() {
     private val isUnknown
         get() = protocolState.value == UNKNOWN
 
+    private val managedStarts = ManagedActivationGate()
+    @Volatile private var activeControlIdentity = ""
+    @Volatile private var activeManagedTicket = ""
+    @Volatile private var managedRequired = false
     private var connectionJob: Job? = null
     private var disconnectionJob: Job? = null
+    private var recoverJob: Job? = null
+    // Mayak: Activity visibility. Health/network events are streamed only to a started
+    // Activity; while it is hidden (frozen) or gone the service watchdog owns recovery.
+    @Volatile private var uiForeground = false
+    private var watchdogJob: Job? = null
+    private var underlyingLost = false
+    private var underlyingLostAt = 0L
+    private var underlyingValidatedAt = 0L
+    // Mayak: the first seconds of a managed session need health for the owner's proof even when
+    // the UI is (or goes) hidden, e.g. a background connect from the notification/tile. Bounded
+    // (at most ~30 one-way messages), then health to a hidden UI pauses again.
+    private var managedStartedAt = 0L
+    private var backendReplacedWhileHidden = false
     private var trafficStatsUpdateJob: Job? = null
+    // Mayak (update without losing the VPN): the managed tunnel being started, as it is restarted
+    // after an app update (no ticket/context), its heartbeat, and a pending resume's deadline.
+    private var resumeCandidateConfig: String? = null
+    private var resumeHeartbeatJob: Job? = null
+    private var resumeDeadlineJob: Job? = null
+    private var awgHealthSendingJob: Job? = null
     // private var statisticsSendingJob: Job? = null
     private lateinit var networkState: NetworkState
+    private lateinit var managedNetworkState: NetworkState
     private lateinit var trafficStats: TrafficStats
     private var controlReceiver: BroadcastReceiver? = null
     private var notificationStateReceiver: BroadcastReceiver? = null
@@ -112,25 +168,28 @@ open class AmneziaVpnService : VpnService() {
     private val isActivityConnected
         get() = clientMessengers.any { it.value.name == ACTIVITY_MESSENGER_NAME }
 
-    private val connectionExceptionHandler = CoroutineExceptionHandler { _, e ->
-        connectionJob?.cancel()
-        connectionJob = null
-        disconnectionJob?.cancel()
-        disconnectionJob = null
-        protocolState.value = DISCONNECTED
-        when (e) {
-            is IllegalArgumentException,
-            is VpnStartException,
-            is VpnException -> onError(e.message ?: e.toString())
+    private fun connectionExceptionHandler(session: ConnectionSession) = CoroutineExceptionHandler { _, e ->
+        mainScope.launch {
+            if (!session.source.isCurrent(activeSession.source)) return@launch
+            connectionJob?.cancel()
+            connectionJob = null
+            disconnectionJob?.cancel()
+            disconnectionJob = null
+            session.source.state.value = DISCONNECTED
+            when (e) {
+                is IllegalArgumentException,
+                is VpnStartException,
+                is VpnException -> onError(e.message ?: e.toString(), session)
 
-            is JSONException,
-            is BadConfigException -> onError("VPN config format error: ${e.message}")
+                is JSONException,
+                is BadConfigException -> onError("VPN config format error: ${e.message}", session)
 
-            is LoadLibraryException -> onError("${e.message}. Caused: ${e.cause?.message}")
+                is LoadLibraryException -> onError("${e.message}. Caused: ${e.cause?.message}", session)
 
-            is UnknownHostException -> onError("Unknown host")
+                is UnknownHostException -> onError("Unknown host", session)
 
-            else -> throw e
+                else -> throw e
+            }
         }
     }
 
@@ -142,9 +201,23 @@ open class AmneziaVpnService : VpnService() {
                 when (action) {
                     Action.REGISTER_CLIENT -> {
                         val clientName = msg.data.getString(MSG_CLIENT_NAME)
-                        val messenger = IpcMessenger(msg.replyTo, clientName)
+                        val replyTarget = msg.replyTo
+                        // Mayak (note 12): a client process that died without UNREGISTER must not
+                        // keep counting as a live, visible Activity (that would keep the watchdog off).
+                        val messenger = IpcMessenger(replyTarget, clientName, onDeadObjectException = {
+                            mainScope.launch {
+                                clientMessengers.remove(replyTarget)?.let { dead ->
+                                    Log.w(TAG, "Messenger client '${dead.name}' is dead")
+                                    if (dead.name == ACTIVITY_MESSENGER_NAME && !isActivityConnected) {
+                                        uiForeground = false; updateWatchdog()
+                                    }
+                                }
+                            }
+                        })
                         clientMessengers[msg.replyTo] = messenger
                         Log.d(TAG, "Messenger client '$clientName' was registered")
+                        // Visibility follows in UI_FOREGROUND/UI_BACKGROUND; until then treat as hidden.
+                        if (clientName == ACTIVITY_MESSENGER_NAME) { uiForeground = false; updateWatchdog() }
                         // if (clientName == ACTIVITY_MESSENGER_NAME && isConnected) launchSendingStatistics()
                     }
 
@@ -152,8 +225,13 @@ open class AmneziaVpnService : VpnService() {
                         clientMessengers.remove(msg.replyTo)?.let {
                             Log.d(TAG, "Messenger client '${it.name}' was unregistered")
                             // if (it.name == ACTIVITY_MESSENGER_NAME) stopSendingStatistics()
+                            if (it.name == ACTIVITY_MESSENGER_NAME) setUiForeground(false, null)
                         }
                     }
+
+                    Action.UI_BACKGROUND -> setUiForeground(false, msg.replyTo)
+                    Action.UI_FOREGROUND -> setUiForeground(true, msg.replyTo)
+                    Action.MANAGED_ADOPT -> managedAdopt(msg)
 
                     Action.CONNECT -> {
                         connect(msg.data.getString(MSG_VPN_CONFIG))
@@ -162,6 +240,10 @@ open class AmneziaVpnService : VpnService() {
                     Action.DISCONNECT -> {
                         disconnect()
                     }
+
+                    Action.MANAGED_STOP -> managedStop(msg)
+                    Action.MANAGED_INSPECT -> managedInspect(msg)
+                    Action.MANAGED_RECOVER -> managedRecover(msg)
 
                     Action.REQUEST_STATUS -> {
                         clientMessengers[msg.replyTo]?.let { clientMessenger ->
@@ -208,10 +290,12 @@ open class AmneziaVpnService : VpnService() {
         super.onCreate()
         Log.d(TAG, "Create Amnezia VPN service")
         mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        connectionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + connectionExceptionHandler)
+        connectionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         loadServerData()
-        launchProtocolStateHandler()
+        launchProtocolStateHandler(activeSession)
         networkState = NetworkState(this, ::reconnect)
+        // Mayak managed sessions: the best non-VPN (underlying) network, never our own VPN.
+        managedNetworkState = NetworkState(this, ::onManagedUnderlyingValidated, ::onDefaultNetworkLost, excludeVpn = true)
         trafficStats = TrafficStats()
         registerBroadcastReceivers()
     }
@@ -219,7 +303,9 @@ open class AmneziaVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val isAlwaysOn = intent != null && intent.action == SERVICE_INTERFACE
 
-        if (isAlwaysOn) {
+        if (intent?.action == MayakResume.ACTION_RESUME_AFTER_UPDATE) {
+            resumeAfterUpdate()
+        } else if (isAlwaysOn) {
             Log.d(TAG, "Start service via Always-on")
             connect()
         } else if (intent?.getBooleanExtra(AFTER_PERMISSION_CHECK, false) == true) {
@@ -227,7 +313,13 @@ open class AmneziaVpnService : VpnService() {
             connect()
         } else {
             Log.d(TAG, "Start service")
-            connect(intent?.getStringExtra(MSG_VPN_CONFIG))
+            val config = intent?.getStringExtra(MSG_VPN_CONFIG)
+            if (config != null && parseConfigToJson(config)?.optString("managedTicket").orEmpty().isNotBlank()) {
+                // Start-service intents can be redelivered out of order. They
+                // cannot activate managed work: live Activity Messenger CONNECT
+                // is required, ordered on the same channel as stop/inspection.
+                pendingVpnConfig = config
+            } else connect(config)
         }
         ServiceCompat.startForeground(
             this, NOTIFICATION_ID,
@@ -266,8 +358,9 @@ open class AmneziaVpnService : VpnService() {
     override fun onRevoke() {
         Log.d(TAG, "onRevoke")
         // Calls to onRevoke() method may not happen on the main thread of the process
+        val revokedSession = activeSession
         mainScope.launch {
-            disconnect()
+            if (revokedSession.source.isCurrent(activeSession.source)) disconnect()
         }
     }
 
@@ -283,8 +376,19 @@ open class AmneziaVpnService : VpnService() {
         super.onDestroy()
     }
 
+    // Mayak: another of our VPN service processes (AwgService / XrayService) runs as a foreground service.
+    private fun otherVpnServiceRunning(): Boolean = runCatching {
+        val own = android.app.Application.getProcessName()
+        VpnProto.values().map { it.processName }.distinct().filter { it != own }.any { isRunning(this, it) }
+    }.getOrDefault(false)
+
     private fun stopService() {
         Log.d(TAG, "Stop service")
+        // Mayak: keep a dismissible "Disconnected · Connect" in the shade after the service ends.
+        // Not when the other Mayak VPN service (AWG <-> Xray path switch) is already running:
+        // that left "Disconnected" next to its "Connected" (two Mayak icons in the status bar).
+        if (isDisconnected && MayakLaunch.isManagedConfigSaved(this) && !otherVpnServiceRunning())
+            serviceNotification.showDisconnected(serverName, vpnProto?.label)
         // the coroutine below will be canceled during the onDestroy call
         mainScope.launch {
             delay(STOP_SERVICE_TIMEOUT)
@@ -362,10 +466,13 @@ open class AmneziaVpnService : VpnService() {
     /**
      * Methods responsible for processing VPN connection
      */
-    private fun launchProtocolStateHandler() {
-        mainScope.launch {
+    private fun launchProtocolStateHandler(session: ConnectionSession) {
+        protocolStateJob?.cancel()
+        protocolStateJob = mainScope.launch {
             // drop first default UNKNOWN state
-            protocolState.drop(1).collect { protocolState ->
+            session.source.state.drop(1).collect { protocolState ->
+                if (!session.source.isCurrent(activeSession.source)) return@collect
+                val statusIdentity = session.source.identity
                 Log.d(TAG, "Protocol state changed: $protocolState")
 
                 serviceNotification.updateNotification(serverName, vpnProto?.label, protocolState)
@@ -373,33 +480,56 @@ open class AmneziaVpnService : VpnService() {
                 clientMessengers.send {
                     ServiceEvent.STATUS_CHANGED.packToMessage {
                         putStatus(protocolState)
+                        if (statusIdentity.ticket != null && statusIdentity.context != null) {
+                            putString(MSG_MANAGED_TICKET, statusIdentity.ticket)
+                            putString(MSG_HEALTH_CONTEXT_ID, statusIdentity.context)
+                        }
                     }
                 }
 
                 VpnStateStore.store { VpnState(protocolState, serverName, serverIndex, vpnProto) }
 
+                // DataStore may suspend while the next session is activated.
+                if (!session.source.isCurrent(activeSession.source)) return@collect
+
                 when (protocolState) {
                     CONNECTED -> {
+                        // Mayak: a "Disconnected" left by the other service of a path switch
+                        // (it may stop after this service started) never stays next to "Connected".
+                        serviceNotification.cancelDisconnected()
                         networkState.bindNetworkListener()
+                        if (managedRequired) managedNetworkState.bindNetworkListener()
                         // if (isActivityConnected) launchSendingStatistics()
                         launchTrafficStatsUpdate()
+                        updateWatchdog()
+                        keepForResumeAfterUpdate()
                     }
 
                     DISCONNECTED -> {
+                        forgetResumeAfterUpdate()
                         networkState.unbindNetworkListener()
+                        managedNetworkState.unbindNetworkListener()
                         stopTrafficStatsUpdateJob()
+                        stopAwgHealthSending()
+                        stopWatchdog()
                         // stopSendingStatistics()
                         if (!isServiceBound) stopService()
                     }
 
                     DISCONNECTING -> {
+                        forgetResumeAfterUpdate()
                         networkState.unbindNetworkListener()
+                        managedNetworkState.unbindNetworkListener()
                         stopTrafficStatsUpdateJob()
+                        stopAwgHealthSending()
+                        stopWatchdog()
                         // stopSendingStatistics()
                     }
 
                     RECONNECTING -> {
                         stopTrafficStatsUpdateJob()
+                        stopAwgHealthSending()
+                        stopWatchdog()
                         // stopSendingStatistics()
                     }
 
@@ -481,11 +611,171 @@ open class AmneziaVpnService : VpnService() {
     }
 
     @MainThread
+    private fun launchAwgHealthSending(protocol: Wireguard) {
+        stopAwgHealthSending()
+        awgHealthSendingJob = mainScope.launch {
+            while (isActive && protocolState.value !in setOf(DISCONNECTED, DISCONNECTING, RECONNECTING, UNKNOWN)) {
+                protocol.tunnelHealth.value?.takeIf { health ->
+                    protocol === activeSession.protocol && protocol.isCurrentTunnelHealth(health)
+                }?.takeIf { uiForeground || (managedStartedAt != 0L &&
+                    android.os.SystemClock.elapsedRealtime() - managedStartedAt < HIDDEN_CONNECT_HEALTH_MS) }?.let { health ->
+                    // Never stream into a stopped (frozen) Activity: see setUiForeground().
+                    clientMessengers.values
+                        .filter { it.name == ACTIVITY_MESSENGER_NAME }
+                        .forEach { messenger ->
+                            messenger.send {
+                                ServiceEvent.AWG_HEALTH_UPDATE.packToMessage {
+                                    putString(MSG_AWG_TUNNEL_HEALTH, health.toJsonString())
+                                }
+                            }
+                        }
+                }
+                delay(STATUS_HEALTH_UPDATE_TIMEOUT)
+            }
+        }
+    }
+
+    /**
+     * Mayak Xray path: there is no peer telemetry. The owner's proof needs this tunnel's own
+     * interface identity (name + address) for a probe bound to it; counters are not available.
+     */
+    @MainThread
+    private fun launchXrayHealthSending(config: JSONObject) {
+        stopAwgHealthSending()
+        val endpoint = xrayEndpoint(config) ?: return
+        awgHealthSendingJob = mainScope.launch {
+            while (isActive && protocolState.value !in setOf(DISCONNECTED, DISCONNECTING, RECONNECTING, UNKNOWN)) {
+                if (activeSession.protocol is Xray && (uiForeground || (managedStartedAt != 0L &&
+                        android.os.SystemClock.elapsedRealtime() - managedStartedAt < HIDDEN_CONNECT_HEALTH_MS))) {
+                    xrayInterfaceName()?.let { name ->
+                        val health = JSONObject().put("healthContextId", activeControlIdentity).put("generation", "1")
+                            .put("peerPublicKey", XRAY_HEALTH_PEER).put("endpoint", endpoint)
+                            .put("localAddress", "$XRAY_LOCAL_ADDRESS/30").put("interfaceName", name)
+                            .put("latestHandshakeEpochMs", "0").put("rxTotal", "0").put("txTotal", "0")
+                            .put("valid", activeControlIdentity.isNotBlank()).toString()
+                        clientMessengers.values
+                            .filter { it.name == ACTIVITY_MESSENGER_NAME }
+                            .forEach { messenger ->
+                                messenger.send {
+                                    ServiceEvent.AWG_HEALTH_UPDATE.packToMessage { putString(MSG_AWG_TUNNEL_HEALTH, health) }
+                                }
+                            }
+                    }
+                }
+                delay(STATUS_HEALTH_UPDATE_TIMEOUT)
+            }
+        }
+    }
+
+    private fun xrayEndpoint(config: JSONObject): String? = try {
+        val data = config.optJSONObject("xray_config_data") ?: return null
+        val vnext = JSONObject(data.optString("config")).getJSONArray("outbounds").getJSONObject(0)
+            .getJSONObject("settings").getJSONArray("vnext").getJSONObject(0)
+        val host = vnext.getString("address")
+        val port = vnext.getInt("port")
+        if (host.isBlank() || port <= 0) null else (if (host.contains(':')) "[$host]" else host) + ":" + port
+    } catch (_: Exception) { null }
+
+    // ---------- Mayak: update without losing the VPN (see MayakResume) ----------
+    @MainThread
+    private fun keepForResumeAfterUpdate() {
+        val config = resumeCandidateConfig
+        // AWG: its handshake proves a restarted tunnel. Xray (owner 21.11: no traffic around the VPN
+        // after an update): the exit agent inside the tunnel proves it (MayakExitAgentCheck).
+        if (!managedRequired || config == null) return
+        val kind = MayakResume.kindOf(this)
+        MayakResume.saveConnected(this, kind, config)
+        resumeHeartbeatJob?.cancel()
+        resumeHeartbeatJob = mainScope.launch {
+            while (isActive) {
+                delay(MayakResume.HEARTBEAT_MS)
+                if (isConnected) MayakResume.heartbeat(this@AmneziaVpnService, kind)
+            }
+        }
+    }
+
+    @MainThread
+    private fun forgetResumeAfterUpdate() {
+        resumeHeartbeatJob?.cancel(); resumeHeartbeatJob = null
+        resumeDeadlineJob?.cancel(); resumeDeadlineJob = null
+        MayakResume.clear(this, MayakResume.kindOf(this))
+    }
+
+    /**
+     * Right after an app update (MayakUpdateReceiver): restart the tunnel that was CONNECTED when the
+     * update killed the processes, with its own one-off ticket. The app adopts it when it starts.
+     * A tunnel that does not come back (AWG: no handshake; Xray: no answer of the exit agent inside
+     * the tunnel) within RESUME_PROOF_MS is stopped again: never a dead VPN that blocks the internet.
+     */
+    @MainThread
+    private fun resumeAfterUpdate() {
+        val kind = MayakResume.kindOf(this)
+        val saved = MayakResume.takeConfig(this, kind)
+        val config = saved?.let { parseConfigToJson(it) }
+        if (config == null || !config.optBoolean("managedRequired") || prepare(applicationContext) != null) {
+            Log.i(TAG, "MayakNet event=update_resume_skipped config=${if (config == null) 0 else 1}")
+            MayakUpdateInstaller.notifyReconnect(this)
+            mainScope.launch { stopSelf() } // after onStartCommand has put it in the foreground
+            return
+        }
+        val ticket = config.optString("managedTicket").ifBlank { "resume:" + java.util.UUID.randomUUID() }
+        config.put("managedTicket", ticket)
+        Log.i(TAG, "MayakNet event=update_resume_start kind=$kind")
+        connectToVpn(config.toString())
+        resumeDeadlineJob?.cancel()
+        resumeDeadlineJob = mainScope.launch {
+            if (this@AmneziaVpnService is XrayService) {
+                // Ask the exit agent every few seconds until it answers or the proof time is over.
+                val until = android.os.SystemClock.elapsedRealtime() + RESUME_PROOF_MS
+                var up = false
+                delay(3_000L)
+                while (!up && android.os.SystemClock.elapsedRealtime() < until) {
+                    if (activeManagedTicket != ticket) return@launch // adopted or replaced meanwhile
+                    up = xrayInterfaceName() != null && withContext(Dispatchers.IO) {
+                        MayakExitAgentCheck.answers(applicationContext, XRAY_LOCAL_ADDRESS, 4_000)
+                    }
+                    if (!up) delay(3_000L)
+                }
+                if (activeManagedTicket != ticket) return@launch
+                Log.i(TAG, "MayakNet event=update_resume_result up=${if (up) 1 else 0} kind=xray")
+                if (!up) { disconnect(); MayakUpdateInstaller.notifyReconnect(this@AmneziaVpnService) }
+                return@launch
+            }
+            delay(RESUME_PROOF_MS)
+            if (activeManagedTicket != ticket) return@launch // adopted or replaced meanwhile
+            val up = (activeSession.protocol as? Wireguard)?.tunnelHealth?.value?.latestHandshakeEpochMs?.let { it > 0L } == true
+            Log.i(TAG, "MayakNet event=update_resume_result up=${if (up) 1 else 0}")
+            if (!up) { disconnect(); MayakUpdateInstaller.notifyReconnect(this@AmneziaVpnService) }
+        }
+    }
+
+    private fun xrayInterfaceName(): String? = try {
+        java.net.NetworkInterface.getNetworkInterfaces()?.toList()?.firstOrNull { ni ->
+            ni.isUp && ni.inetAddresses.toList().any { it.hostAddress == XRAY_LOCAL_ADDRESS }
+        }?.name
+    } catch (_: Exception) { null }
+
+    @MainThread
+    private fun stopAwgHealthSending() {
+        awgHealthSendingJob?.cancel()
+        awgHealthSendingJob = null
+    }
+
+    private var pendingVpnConfig: String? = null
+
+    @MainThread
     private fun connect(vpnConfig: String? = null) {
         if (vpnConfig == null) {
-            connectToVpn(Prefs.load(PREFS_CONFIG_KEY))
+            connectToVpn(pendingVpnConfig ?: Prefs.load(PREFS_CONFIG_KEY))
         } else {
-            Prefs.save(PREFS_CONFIG_KEY, vpnConfig)
+            val persisted = parseConfigToJson(vpnConfig)?.apply {
+                remove("healthContextId")
+                if (optString("managedTicket").isNotBlank()) put("managedRequired", true)
+                remove("managedTicket")
+            }?.toString().orEmpty()
+            Prefs.save(PREFS_CONFIG_KEY, persisted)
+            MayakLaunch.markManagedConfig(this, parseConfigToJson(persisted)?.optBoolean("managedRequired") == true)
+            pendingVpnConfig = vpnConfig
             connectToVpn(vpnConfig)
         }
     }
@@ -512,72 +802,516 @@ open class AmneziaVpnService : VpnService() {
             return
         }
 
-        protocolState.value = CONNECTING
+        val managedTicket = config.optString("managedTicket")
+        // The resume copy keeps the owner's ticket: the app adopts the restarted tunnel by it
+        // (device test 21.11: a fresh ticket was refused and the app reconnected from scratch).
+        resumeCandidateConfig = if (managedTicket.isNotBlank()) JSONObject(config.toString()).apply {
+            remove("healthContextId"); put("managedRequired", true)
+        }.toString() else null
+        managedRequired = config.optBoolean("managedRequired") || managedTicket.isNotBlank()
+        if (managedRequired && managedTicket.isBlank()) return // restored managed work has no live authority
+        val ticket = managedTicket.ifBlank { "legacy:" + java.util.UUID.randomUUID() }
+        val previousSession = activeSession
+        // Keep the old backend addressable until its stop has actually completed.
+        // Normal managed replacement reaches here only after its exact stop ACK.
+        if ((previousSession.protocol as? Wireguard)?.managedIsBackendOff() == false || connectionJob?.isActive == true) {
+            onError("Previous VPN session is not stopped", previousSession)
+            return
+        }
+        if (!managedStarts.begin(ticket)) return
+        val protocol = try {
+            if (managedTicket.isNotBlank()) vpnProto!!.newManagedProtocol() else vpnProto!!.protocol
+        } catch (e: IllegalArgumentException) {
+            onError(e.message.orEmpty())
+            return
+        }
+        activeManagedTicket = managedTicket
+        if (managedTicket.isNotBlank()) MayakLaunch.markManagedXray(this, protocol is Xray)
+        stopWatchdog()
+        backendReplacedWhileHidden = false
+        underlyingLost = false
+        underlyingValidatedAt = 0L
+        managedStartedAt = if (managedTicket.isNotBlank()) android.os.SystemClock.elapsedRealtime() else 0L
+        serviceNotification.cancelDisconnected()
+        val controlIdentity = config.optString("healthContextId").ifBlank { java.util.UUID.randomUUID().toString() }
+        config.put("healthContextId", controlIdentity)
+        activeControlIdentity = controlIdentity
+        val session = ConnectionSession(ManagedProtocolState(managedTicket, controlIdentity, UNKNOWN), protocol)
+        activeSession = session
+        launchProtocolStateHandler(session)
+        session.source.state.value = CONNECTING
 
         if (!checkPermission()) {
             protocolState.value = DISCONNECTED
             return
         }
 
-        connectionJob = connectionScope.launch {
-            disconnectionJob?.join()
-            disconnectionJob = null
-
-            vpnProto?.protocol?.let { protocol ->
-                protocol.initialize(applicationContext, protocolState, ::onError)
-                protocol.startVpn(config, Builder(), ::protect)
+        pendingVpnConfig = null
+        val previousDisconnection = disconnectionJob
+        connectionJob = connectionScope.launch(connectionExceptionHandler(session)) {
+            previousDisconnection?.join()
+            if (!isActive || !session.source.isCurrent(activeSession.source) || !managedStarts.accepts(ticket)) return@launch
+            protocol.initialize(applicationContext, session.source.state) { error -> onError(error, session) }
+            if (!isActive || !session.source.isCurrent(activeSession.source) || !managedStarts.commit(ticket)) return@launch
+            protocol.startVpn(config, Builder(), ::protect)
+            (protocol as? Wireguard)?.let { awg -> mainScope.launch {
+                if (session.source.isCurrent(activeSession.source)) launchAwgHealthSending(awg)
+            } }
+            if (managedTicket.isNotBlank() && protocol is Xray) mainScope.launch {
+                if (session.source.isCurrent(activeSession.source)) launchXrayHealthSending(config)
             }
         }
     }
 
     @MainThread
     private fun disconnect() {
+        managedStarts.invalidateAll()
+        pendingVpnConfig = null
+        stopAwgHealthSending()
+        // Mayak: an Xray session stopped outside the owner (revoke, notification) is no longer
+        // the managed backend a cold-started app must inspect.
+        if (activeSession.protocol is Xray) MayakLaunch.markManagedXray(this, false)
         if (isUnknown || isDisconnected || protocolState.value == DISCONNECTING) return
 
         Log.d(TAG, "Stop VPN connection")
+        // Mayak: a managed session stopped outside the Qt owner (notification/tile "Disconnect",
+        // VPN revoked). Tell the owner it was the user's stop, not a fault to recover from.
+        if (managedRequired && activeControlIdentity.isNotBlank()) {
+            Log.i(TAG, "MayakNet event=user_stop")
+            val result = JSONObject().put("type", "managedUserStop").put("owner", "MayakVpnAwgLifecycleV1")
+                .put("healthContextId", activeControlIdentity).toString()
+            clientMessengers.values.filter { it.name == ACTIVITY_MESSENGER_NAME }.forEach { messenger ->
+                messenger.send { ServiceEvent.MANAGED_RESULT.packToMessage { putString(MSG_MANAGED_RESULT, result) } }
+            }
+        }
+        stopWatchdog()
 
         protocolState.value = DISCONNECTING
+        val session = activeSession
+        val connectionToCancel = connectionJob
+        val recoveryToFinish = recoverJob
+        disconnectionJob = connectionScope.launch(connectionExceptionHandler(session)) {
+            connectionToCancel?.cancelAndJoin()
+            if (connectionJob === connectionToCancel) connectionJob = null
+            // Mayak: a soft replacement in flight would bring a new backend up after this stop.
+            recoveryToFinish?.join()
 
-        disconnectionJob = connectionScope.launch {
-            connectionJob?.cancelAndJoin()
-            connectionJob = null
-
-            vpnProto?.protocol?.stopVpn()
+            session.protocol?.stopVpn()
 
             try {
                 withTimeout(DISCONNECT_TIMEOUT) {
                     // waiting for disconnect state
-                    protocolState.first { it == DISCONNECTED }
+                    session.source.state.first { it == DISCONNECTED }
                 }
             } catch (e: TimeoutCancellationException) {
                 Log.w(TAG, "Disconnect timeout")
-                stopService()
+                if (session.source.isCurrent(activeSession.source)) stopService()
             }
         }
     }
 
+    // The Looper recycles a Message after dispatch: async answers keep only the reply target.
+    private fun sendManaged(replyTo: Messenger?, result: JSONObject) {
+        result.put("owner", "MayakVpnAwgLifecycleV1")
+        replyTo?.let { target -> IpcMessenger(target).send {
+            ServiceEvent.MANAGED_RESULT.packToMessage { putString(MSG_MANAGED_RESULT, result.toString()) }
+        } }
+    }
+
+    @MainThread
+    private fun managedStop(msg: Message) {
+        val request = msg.data.getString("stopRequestId").orEmpty()
+        val identity = msg.data.getString("healthContextId").orEmpty()
+        val ticket = msg.data.getString("managedTicket").orEmpty()
+        if (request.length != 64 || identity.isBlank()) return
+        val replyTo = msg.replyTo
+        if (identity != activeControlIdentity || (ticket != activeManagedTicket && ticket != "recovery:" + identity)) {
+            // Mayak: a fresh service instance (e.g. after a system-UI disconnect ended the old one)
+            // runs no backend at all, so the asked context is definitely down. If anything else
+            // runs, the answer stays "not stopped".
+            val nothingRuns = activeControlIdentity.isBlank() && (isUnknown || isDisconnected) &&
+                (activeSession.protocol as? Wireguard)?.managedIsBackendOff() != false &&
+                connectionJob?.isActive != true && recoverJob?.isActive != true
+            if (nothingRuns) Log.i(TAG, "MayakNet event=stop_nothing_running")
+            sendManaged(replyTo, JSONObject().put("type", "managedStopped").put("stopRequestId", request)
+                .put("healthContextId", identity).put("stopped", nothingRuns))
+            return
+        }
+        managedStarts.invalidateAll()
+        pendingVpnConfig = null
+        connectionJob?.cancel()
+        stopAwgHealthSending()
+        stopWatchdog()
+        backendReplacedWhileHidden = false
+        val session = activeSession
+        val connectionToCancel = connectionJob
+        val previousDisconnection = disconnectionJob
+        val recoveryToFinish = recoverJob
+        mainScope.launch {
+            var stopped = false
+            try {
+                withTimeout(3000) {
+                    connectionToCancel?.cancelAndJoin()
+                    if (connectionJob === connectionToCancel) connectionJob = null
+                    previousDisconnection?.join()
+                    recoveryToFinish?.join() // never stop a backend while it is being replaced
+                    if (session.source.isCurrent(activeSession.source) && identity == activeControlIdentity) {
+                        stopped = when (val running = session.protocol) {
+                            is Wireguard -> running.managedStopAndConfirm()
+                            is Xray -> {
+                                // Down = the Xray tunnel interface is gone after the engine stop.
+                                running.stopVpn()
+                                var gone = xrayInterfaceName() == null
+                                while (!gone) { delay(100); gone = xrayInterfaceName() == null }
+                                if (gone) MayakLaunch.markManagedXray(this@AmneziaVpnService, false)
+                                gone
+                            }
+                            else -> false
+                        }
+                        if (stopped) {
+                            // Preserve the event's source owner even after control authority is reset.
+                            session.source.state.value = DISCONNECTED
+                            activeControlIdentity = ""
+                            activeManagedTicket = ""
+                        }
+                    }
+                }
+            } catch (_: Exception) { stopped = false }
+            sendManaged(replyTo, JSONObject().put("type", "managedStopped").put("stopRequestId", request)
+                .put("healthContextId", identity).put("stopped", stopped))
+        }
+    }
+
+    @MainThread
+    private fun managedInspect(msg: Message) {
+        val request = msg.data.getString("inspectRequestId").orEmpty()
+        if (request.length != 64) return
+        val replyTo = msg.replyTo
+        managedStarts.invalidateAll()
+        pendingVpnConfig = null
+        connectionJob?.cancel()
+        val session = activeSession
+        val connectionToCancel = connectionJob
+        mainScope.launch {
+            var ownState = "unknown"
+            try {
+                withTimeout(3000) {
+                    connectionToCancel?.cancelAndJoin()
+                    if (connectionJob === connectionToCancel) connectionJob = null
+                    if (!session.source.isCurrent(activeSession.source)) return@withTimeout
+                    val protocol = session.protocol as? Wireguard
+                    ownState = if (session.protocol is Xray) {
+                        val up = xrayInterfaceName() != null
+                        if (!up && activeControlIdentity.isBlank()) "off" else if (activeControlIdentity.isNotBlank()) "active" else "unknown"
+                    } else if (protocol?.managedIsBackendOff() == true || (protocol == null && isUnknown)) "off"
+                        else if (activeControlIdentity.isNotBlank()) "active" else "unknown"
+                }
+            } catch (_: Exception) { }
+            sendManaged(replyTo, JSONObject().put("type", "managedInspection").put("inspectRequestId", request)
+                .put("state", ownState).put("controlIdentity", if (ownState == "active") activeControlIdentity else ""))
+        }
+    }
+
+    /**
+     * Mayak managed soft recovery: replace the AWG backend (new UDP socket/source port)
+     * under the same managed ticket and proof context. No admission, no VPN teardown.
+     */
+    @MainThread
+    private fun managedRecover(msg: Message) {
+        val request = msg.data.getString("recoverRequestId").orEmpty()
+        val identity = msg.data.getString("healthContextId").orEmpty()
+        val ticket = msg.data.getString("managedTicket").orEmpty()
+        if (request.length != 64 || identity.isBlank()) return
+        val session = activeSession
+        val protocol = session.protocol as? Wireguard
+        // The Looper recycles msg after dispatch; keep the reply target for the async answer.
+        val replyTo = msg.replyTo
+        fun reply(recovered: Boolean) {
+            val result = JSONObject().put("type", "managedRecovered").put("owner", "MayakVpnAwgLifecycleV1")
+                .put("recoverRequestId", request).put("healthContextId", identity).put("recovered", recovered)
+            replyTo?.let { target -> IpcMessenger(target).send {
+                ServiceEvent.MANAGED_RESULT.packToMessage { putString(MSG_MANAGED_RESULT, result.toString()) }
+            } }
+        }
+        if (!managedRequired || identity != activeControlIdentity || ticket.isBlank() || ticket != activeManagedTicket ||
+            protocol == null || !session.source.isCurrent(activeSession.source) ||
+            !replaceManagedBackend("qt") { ok -> reply(ok) }) {
+            Log.i(TAG, "MayakNet event=recover_rejected")
+            reply(false)
+        }
+    }
+
+    /**
+     * Mayak adoption: a cold-started Qt owner proves it owns the running managed backend by
+     * presenting the exact control identity AND ticket (its persisted attempt id). Nothing is
+     * revealed to the caller. On a match the backend gets the same soft replacement as a
+     * recovery (new socket, same TUN/context), so the owner's normal tunnel proof sees a fresh
+     * handshake. Any mismatch is a plain refusal; the owner then stops it the old way.
+     */
+    @MainThread
+    private fun managedAdopt(msg: Message) {
+        val request = msg.data.getString("adoptRequestId").orEmpty()
+        val identity = msg.data.getString("healthContextId").orEmpty()
+        val ticket = msg.data.getString("managedTicket").orEmpty()
+        if (request.length != 64 || identity.isBlank()) return
+        val replyTo = msg.replyTo // the Looper recycles msg after dispatch
+        fun reply(adopted: Boolean) {
+            val result = JSONObject().put("type", "managedAdopted").put("owner", "MayakVpnAwgLifecycleV1")
+                .put("adoptRequestId", request).put("healthContextId", identity).put("adopted", adopted)
+            replyTo?.let { target -> IpcMessenger(target).send {
+                ServiceEvent.MANAGED_RESULT.packToMessage { putString(MSG_MANAGED_RESULT, result.toString()) }
+            } }
+        }
+        // The running backend is handed over as is: a replacement (new socket) loses its first
+        // handshake and costs seconds; the owner proves the live session through the tunnel.
+        val protocol = activeSession.protocol as? Wireguard
+        if (!managedRequired || identity != activeControlIdentity || ticket.isBlank() || ticket != activeManagedTicket ||
+            protocol == null || !isConnected || protocol.managedIsBackendOff() ||
+            connectionJob?.isActive == true || disconnectionJob?.isActive == true || recoverJob?.isActive == true) {
+            Log.i(TAG, "MayakNet event=adopt_rejected")
+            reply(false)
+            return
+        }
+        backendReplacedWhileHidden = false
+        // The owner proves and watches the tunnel from now on.
+        resumeDeadlineJob?.cancel(); resumeDeadlineJob = null
+        Log.i(TAG, "MayakNet event=adopt_handover")
+        reply(true)
+    }
+
+    /**
+     * Shared soft replacement core (Qt request or service watchdog): new AWG backend, same
+     * managed ticket and proof context. Returns false when not allowed right now.
+     */
+    @MainThread
+    private fun replaceManagedBackend(origin: String, onDone: (Boolean) -> Unit): Boolean {
+        val identity = activeControlIdentity
+        val session = activeSession
+        val protocol = session.protocol as? Wireguard
+        if (!managedRequired || identity.isBlank() || activeManagedTicket.isBlank() || protocol == null || !isConnected ||
+            connectionJob?.isActive == true || disconnectionJob?.isActive == true || recoverJob?.isActive == true) return false
+        Log.i(TAG, "MayakNet event=recover_start origin=$origin")
+        // The backend generation changes now; a hidden Qt owner learns it via managedResume.
+        if (!(uiForeground && isActivityConnected)) backendReplacedWhileHidden = true
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        recoverJob = connectionScope.launch {
+            val replaced = protocol.managedRecover(Builder(), ::protect, identity)
+            mainScope.launch {
+                val current = session.source.isCurrent(activeSession.source) && identity == activeControlIdentity
+                val ok = replaced && current
+                Log.i(TAG, "MayakNet event=${if (ok) "recover_applied" else "recover_failed"} origin=$origin " +
+                    "elapsed_ms=${android.os.SystemClock.elapsedRealtime() - startedAt}")
+                onDone(ok)
+            }
+        }
+        return true
+    }
+
+    /**
+     * Activity visibility. Android freezes a stopped Activity's process; one-way health
+     * messages into it exhaust its async binder space and the system kills the UI. So health
+     * and network events go only to a started Activity, and on return it first receives a
+     * managedResume summary (was the backend replaced meanwhile, is the network up).
+     */
+    @MainThread
+    private fun setUiForeground(foreground: Boolean, replyTo: Messenger?) {
+        if (foreground) {
+            val messenger = replyTo?.let { clientMessengers[it] } ?: return
+            if (messenger.name != ACTIVITY_MESSENGER_NAME) return
+            uiForeground = true
+            val identity = activeControlIdentity
+            if (managedRequired && isConnected && identity.isNotBlank()) {
+                val result = JSONObject().put("type", "managedResume").put("owner", "MayakVpnAwgLifecycleV1")
+                    .put("healthContextId", identity).put("backendReplaced", backendReplacedWhileHidden)
+                    .put("networkAvailable", !underlyingLost).toString()
+                messenger.send { ServiceEvent.MANAGED_RESULT.packToMessage { putString(MSG_MANAGED_RESULT, result) } }
+                Log.i(TAG, "MayakNet event=ui_resume replaced=${if (backendReplacedWhileHidden) 1 else 0} " +
+                    "no_network=${if (underlyingLost) 1 else 0}")
+            }
+            backendReplacedWhileHidden = false
+        } else if (uiForeground) {
+            // Only the Activity's own messenger may report the UI hidden (note 12).
+            if (replyTo?.let { clientMessengers[it] }?.name != ACTIVITY_MESSENGER_NAME) return
+            uiForeground = false
+            Log.i(TAG, "MayakNet event=ui_hidden")
+        }
+        updateWatchdog()
+    }
+
+    @MainThread
+    private fun updateWatchdog() {
+        val wanted = managedRequired && isConnected && !(uiForeground && isActivityConnected)
+        if (!wanted) { stopWatchdog(); return }
+        if (watchdogJob?.isActive == true) return
+        val session = activeSession
+        val protocol = session.protocol as? Wireguard ?: return
+        watchdogJob = mainScope.launch { runWatchdog(session, protocol) }
+    }
+
+    @MainThread
+    private fun stopWatchdog() {
+        watchdogJob?.cancel()
+        watchdogJob = null
+    }
+
+    /**
+     * Stuck-tunnel watchdog while no live Qt owner can act (UI hidden/frozen or killed).
+     * Same signals as the Qt ladder, from own-peer telemetry only (no addresses, no traffic
+     * content): the device keeps sending but nothing comes back and the handshake is stale,
+     * or right after a network change RX stays flat. Bounded: 0 / 10 / 30 s, then 60 s.
+     */
+    private suspend fun runWatchdog(session: ConnectionSession, protocol: Wireguard) {
+        Log.i(TAG, "MayakNet event=watchdog_on")
+        var generation = Long.MIN_VALUE
+        var lastRx = -1L
+        var rxChangedAt = 0L
+        var txAtRxChange = 0L
+        var invalidSince = 0L
+        var attempts = 0
+        var nextAt = 0L
+        var failoverAt = 0L
+        try {
+            while (true) {
+                delay(WATCHDOG_TICK_MS)
+                if (!session.source.isCurrent(activeSession.source) || !managedRequired || !isConnected) break
+                if (uiForeground && isActivityConnected) break
+                val now = android.os.SystemClock.elapsedRealtime()
+                val sample = protocol.tunnelHealth.value?.takeIf { protocol.isCurrentTunnelHealth(it) }
+                val health = sample?.takeIf { it.valid }
+                var stuck = false
+                var reason = ""
+                if (health == null) {
+                    // A replaced backend that never completes a handshake reports no valid health.
+                    if (invalidSince == 0L) invalidSince = now
+                    if (now - invalidSince >= WATCHDOG_NO_HANDSHAKE_MS) { stuck = true; reason = "no_handshake" }
+                } else {
+                    invalidSince = 0L
+                    if (health.generation != generation || health.rxTotal < lastRx) {
+                        generation = health.generation; lastRx = health.rxTotal
+                        rxChangedAt = now; txAtRxChange = health.txTotal
+                        continue
+                    }
+                    if (health.rxTotal > lastRx) {
+                        lastRx = health.rxTotal; rxChangedAt = now; txAtRxChange = health.txTotal
+                        attempts = 0; nextAt = 0L
+                        continue
+                    }
+                    val recentNetwork = underlyingValidatedAt != 0L && now - underlyingValidatedAt < WATCHDOG_RECENT_NETWORK_MS
+                    val rxStale = now - rxChangedAt
+                    val txGrew = health.txTotal > txAtRxChange
+                    val handshakeAge = System.currentTimeMillis() - health.latestHandshakeEpochMs
+                    stuck = txGrew && if (recentNetwork) rxStale >= WATCHDOG_RX_STALE_AFTER_NETWORK_MS
+                        else rxStale >= WATCHDOG_RX_STALE_MS && handshakeAge >= WATCHDOG_HANDSHAKE_AGE_MS
+                    if (stuck) reason = if (recentNetwork) "rx_flat_after_network" else "handshake_stale"
+                }
+                // A loss without a later VALIDATED (captive checks often fail in RU) expires,
+                // like the Qt owner's network-lost window: never disable repair for the session.
+                val lost = underlyingLost && now - underlyingLostAt < WATCHDOG_NETWORK_LOST_EXPIRY_MS
+                if (!stuck || lost || now < nextAt) continue
+                // Mayak failover: new sockets to this exit did not help, the network is up, so the
+                // exit itself is unreachable. Wake the Qt owner to reconnect, another exit first.
+                if (attempts >= WATCHDOG_FAILOVER_AFTER_ATTEMPTS && now >= failoverAt && requestOwnerFailover()) {
+                    failoverAt = now + WATCHDOG_FAILOVER_REPEAT_MS
+                    nextAt = now + WATCHDOG_BACKOFF_MS.last()
+                    Log.i(TAG, "MayakNet event=watchdog_failover reason=$reason attempts=$attempts")
+                    continue
+                }
+                val delayMs = WATCHDOG_BACKOFF_MS[minOf(attempts, WATCHDOG_BACKOFF_MS.size - 1)]
+                if (!replaceManagedBackend("watchdog") { ok ->
+                        Log.i(TAG, "MayakNet event=watchdog_result ok=${if (ok) 1 else 0} attempt=$attempts")
+                    }) continue
+                attempts++
+                nextAt = now + delayMs
+                invalidSince = 0L
+                Log.i(TAG, "MayakNet event=watchdog_stuck reason=$reason attempt=$attempts next_s=${delayMs / 1000}")
+            }
+        } finally {
+            Log.i(TAG, "MayakNet event=watchdog_off")
+        }
+    }
+
+    /**
+     * Explicit, package-local broadcast to [MayakFailoverReceiver] in the app's main process. A
+     * broadcast is delivered even to a cached (frozen) process; the receiver hands the request
+     * to a running Qt owner and keeps the process runnable while it switches exits. Carries only
+     * the random health-context id.
+     */
+    @MainThread
+    private fun requestOwnerFailover(): Boolean {
+        val identity = activeControlIdentity
+        // Review N6: only a live owner (its Activity messenger still registered) can switch
+        // exits; never start the app process just to find nobody there.
+        if (!managedRequired || identity.isBlank() || !isActivityConnected) return false
+        Log.i(TAG, "MayakNet event=failover_request")
+        sendBroadcast(Intent(this, MayakFailoverReceiver::class.java)
+            .setAction(MayakLaunch.ACTION_FAILOVER)
+            .putExtra(MayakLaunch.EXTRA_HEALTH_CONTEXT, identity))
+        return true
+    }
+
+    // Underlying network events for the Mayak managed owner. No addresses or network ids.
+    @MainThread
+    private fun notifyManagedNetwork(state: String) {
+        val identity = activeControlIdentity
+        if (!managedRequired || identity.isBlank()) return
+        Log.i(TAG, "MayakNet event=$state")
+        // A hidden (frozen) Activity gets the current network state in managedResume instead.
+        if (!uiForeground) return
+        val result = JSONObject().put("type", "managedNetwork").put("owner", "MayakVpnAwgLifecycleV1")
+            .put("healthContextId", identity).put("state", state).toString()
+        clientMessengers.values.filter { it.name == ACTIVITY_MESSENGER_NAME }.forEach { messenger ->
+            messenger.send { ServiceEvent.MANAGED_RESULT.packToMessage { putString(MSG_MANAGED_RESULT, result) } }
+        }
+    }
+
+    @MainThread
+    private fun onDefaultNetworkLost() {
+        underlyingLost = true
+        underlyingLostAt = android.os.SystemClock.elapsedRealtime()
+        if (managedRequired && isConnected) notifyManagedNetwork("network_lost")
+    }
+
+    // Managed sessions never restart (no new admission) autonomously; the Qt owner decides,
+    // and while it is hidden the watchdog may only do the same soft backend replacement.
+    @MainThread
+    private fun onManagedUnderlyingValidated() {
+        underlyingLost = false
+        underlyingValidatedAt = android.os.SystemClock.elapsedRealtime()
+        if (managedRequired && isConnected) notifyManagedNetwork("network_validated")
+    }
+
     @MainThread
     private fun reconnect() {
-        if (!isConnected) return
+        if (managedRequired || !isConnected) return
 
         Log.d(TAG, "Reconnect VPN")
 
         protocolState.value = RECONNECTING
-
-        connectionJob = connectionScope.launch {
-            vpnProto?.protocol?.reconnectVpn(Builder(), ::protect)
+        val session = activeSession
+        connectionJob = connectionScope.launch(connectionExceptionHandler(session)) {
+            session.protocol?.reconnectVpn(Builder(), ::protect)
+            (session.protocol as? Wireguard)?.let { protocol ->
+                mainScope.launch { if (session.source.isCurrent(activeSession.source)) launchAwgHealthSending(protocol) }
+            }
         }
     }
 
     /**
      * Utils methods
      */
-    private fun onError(msg: String) {
+    private fun onError(msg: String, session: ConnectionSession = activeSession) {
         Log.e(TAG, msg)
         mainScope.launch {
+            if (!session.source.isCurrent(activeSession.source)) return@launch
             clientMessengers.send {
                 ServiceEvent.ERROR.packToMessage {
                     putString(MSG_ERROR, msg)
+                    session.source.identity.let { identity ->
+                        if (identity.ticket != null && identity.context != null) {
+                            putString(MSG_MANAGED_TICKET, identity.ticket)
+                            putString(MSG_HEALTH_CONTEXT_ID, identity.context)
+                        }
+                    }
                 }
             }
         }

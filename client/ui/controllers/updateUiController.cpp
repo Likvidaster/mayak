@@ -3,16 +3,55 @@
 #include <QDate>
 #include <QLocale>
 
+#if defined(Q_OS_ANDROID)
+#include "platforms/android/android_controller.h"
+#endif
+
 UpdateUiController::UpdateUiController(UpdateController* updateController, QObject *parent)
     : QObject(parent), m_updateController(updateController)
 {
     if (m_updateController) {
         connect(m_updateController, &UpdateController::updateFound, this, &UpdateUiController::updateFound);
         connect(m_updateController, &UpdateController::updateNotFound, this, &UpdateUiController::updateNotFound);
+        connect(m_updateController, &UpdateController::updateFound, this, &UpdateUiController::updateMetadataChanged);
+        connect(m_updateController, &UpdateController::updateNotFound, this, &UpdateUiController::updateMetadataChanged);
         connect(m_updateController, &UpdateController::updateCheckFailed, this, &UpdateUiController::updateCheckFailed);
         connect(m_updateController, &UpdateController::updateStateChanged, this, &UpdateUiController::updateStateChanged);
         connect(m_updateController, &UpdateController::updateCheckRunningChanged, this, &UpdateUiController::isCheckRunningChanged);
+        connect(m_updateController, &UpdateController::downloadProgressChanged, this, &UpdateUiController::downloadProgressChanged);
+        connect(m_updateController, &UpdateController::statusMessageChanged, this, &UpdateUiController::statusMessageChanged);
+        connect(m_updateController, &UpdateController::autoUpdateEnabledChanged, this, &UpdateUiController::autoUpdateEnabledChanged);
+        connect(m_updateController, &UpdateController::needsInstallPermissionChanged, this, &UpdateUiController::needsInstallPermissionChanged);
     }
+}
+
+bool UpdateUiController::autoUpdateEnabled() const
+{
+    return m_updateController && m_updateController->isAutoUpdateEnabled();
+}
+
+void UpdateUiController::setAutoUpdateEnabled(bool enabled)
+{
+    if (m_updateController) m_updateController->setAutoUpdateEnabled(enabled);
+}
+
+bool UpdateUiController::needsInstallPermission() const
+{
+    return m_updateController && m_updateController->needsInstallPermission();
+}
+
+void UpdateUiController::openInstallPermissionSettings()
+{
+#if defined(Q_OS_ANDROID)
+    AndroidController::instance()->openInstallPermissionSettings();
+#endif
+}
+
+void UpdateUiController::openVpnSystemSettings()
+{
+#if defined(Q_OS_ANDROID)
+    AndroidController::instance()->openVpnSystemSettings();
+#endif
 }
 
 QString UpdateUiController::getVersion() const
@@ -77,11 +116,29 @@ bool UpdateUiController::isCheckRunning() const
     return m_updateController ? m_updateController->isUpdateCheckRunning() : false;
 }
 
+int UpdateUiController::downloadProgress() const
+{
+    return m_updateController ? m_updateController->getDownloadProgress() : 0;
+}
+
+QString UpdateUiController::statusMessage() const
+{
+    return m_updateController ? m_updateController->getStatusMessage() : QString();
+}
+
+bool UpdateUiController::isUpdateSupported() const
+{
+    return m_updateController && m_updateController->isUpdateSupported();
+}
+
 void UpdateUiController::checkForUpdates()
 {
-    if (m_updateController) {
-        m_updateController->checkForUpdates();
-    }
+    if (!m_updateController || !m_updateController->isUpdateSupported()
+        || m_updateController->isUpdateCheckRunning()
+        || m_updateController->getUpdateState() == UpdateState::State::Downloading) return;
+
+    emit manualCheckStarted();
+    m_updateController->checkForUpdates();
 }
 
 void UpdateUiController::update()
@@ -102,5 +159,12 @@ void UpdateUiController::retry()
 {
     if (m_updateController) {
         m_updateController->startUpdate();
+    }
+}
+
+void UpdateUiController::cancel()
+{
+    if (m_updateController) {
+        m_updateController->cancelUpdate();
     }
 }

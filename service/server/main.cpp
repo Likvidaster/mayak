@@ -30,8 +30,12 @@ int runApplication(int argc, char** argv)
         }
 
         if (!tokens.empty() && tokens[0] == "tunneldaemon") {
-            WindowsDaemonTunnel *daemon = new WindowsDaemonTunnel();
-            daemon->run(tokens);
+            // Mayak: the tunnel service process only runs tunnel.dll and then exits. Falling through
+            // made it a second Mayak service after every disconnect (same IPC pipe names, its own
+            // daemon, split-tunnel driver and kill switch), so some app commands reached a stateless
+            // process (the app then said "VPN service is not responding").
+            WindowsDaemonTunnel daemon;
+            return daemon.run(tokens);
         }
     }
 #endif

@@ -1,8 +1,14 @@
 #include <QJniEnvironment>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QQmlFile>
 #include <QEventLoop>
 #include <QImage>
+#include <QUuid>
+#include <QThread>
+#include <QCoreApplication>
+#include <QDeadlineTimer>
+#include <QHostAddress>
 
 #include <android/bitmap.h>
 
@@ -23,6 +29,7 @@ AndroidController::AndroidController() : QObject()
 {
     connect(this, &AndroidController::status, this,
             [this](AndroidController::ConnectionState state) {
+                m_vpnState = state;
                 qDebug() << "Android event: status =" << textConnectionState(state);
                 if (isWaitingStatus) {
                     qDebug() << "Initialization by service status";
@@ -37,6 +44,7 @@ AndroidController::AndroidController() : QObject()
         [this]() {
             qDebug() << "Android event: service disconnected";
             isWaitingStatus = true;
+            m_expectedHealth = {};
             emit connectionStateChanged(Vpn::ConnectionState::Disconnected);
         },
         Qt::QueuedConnection);
@@ -46,6 +54,7 @@ AndroidController::AndroidController() : QObject()
         [this]() {
             qDebug() << "Android event: service error";
             // todo: add error message
+            m_expectedHealth = {};
             emit connectionStateChanged(Vpn::ConnectionState::Error);
         },
         Qt::QueuedConnection);
@@ -54,6 +63,7 @@ AndroidController::AndroidController() : QObject()
         this, &AndroidController::vpnPermissionRejected, this,
         [this]() {
             qWarning() << "Android event: VPN permission rejected";
+            m_expectedHealth = {};
             emit connectionStateChanged(Vpn::ConnectionState::Disconnected);
         },
         Qt::QueuedConnection);
@@ -61,6 +71,9 @@ AndroidController::AndroidController() : QObject()
     connect(
         this, &AndroidController::vpnStateChanged, this,
         [this](AndroidController::ConnectionState state) {
+            m_vpnState = state;
+            if (state == ConnectionState::DISCONNECTED || state == ConnectionState::DISCONNECTING ||
+                state == ConnectionState::RECONNECTING || state == ConnectionState::UNKNOWN) m_expectedHealth = {};
             qDebug() << "Android event: VPN state changed:" << textConnectionState(state);
             emit connectionStateChanged(convertState(state));
         },
@@ -96,6 +109,9 @@ bool AndroidController::initialize()
         {"onNotificationStateChanged", "()V", reinterpret_cast<void *>(onNotificationStateChanged)},
         {"onVpnStateChanged", "(I)V", reinterpret_cast<void *>(onVpnStateChanged)},
         {"onStatisticsUpdate", "(JJ)V", reinterpret_cast<void *>(onStatisticsUpdate)},
+        {"onAwgTunnelHealth", "(Ljava/lang/String;)V", reinterpret_cast<void *>(onAwgTunnelHealth)},
+        {"onManagedLifecycle", "(Ljava/lang/String;)V", reinterpret_cast<void *>(onManagedLifecycle)},
+        {"onManagedPermissionPreflightResult", "(Ljava/lang/String;I)V", reinterpret_cast<void *>(onManagedPermissionPreflightResult)},
         {"onFileOpened", "(Ljava/lang/String;)V", reinterpret_cast<void *>(onFileOpened)},
         {"onFileSaved", "(ZZ)V", reinterpret_cast<void *>(onFileSaved)},
         {"onConfigImported", "(Ljava/lang/String;)V", reinterpret_cast<void *>(onConfigImported)},
@@ -138,7 +154,29 @@ void AndroidController::callActivityMethod(const char *methodName, const char *s
 ErrorCode AndroidController::start(const QJsonObject &vpnConfig)
 {
     isWaitingStatus = false;
-    auto config = QJsonDocument(vpnConfig).toJson();
+    QJsonObject configured = vpnConfig;
+    const QString protocol = configured.value("protocol").toString();
+    const QJsonObject peer = configured.value(protocol + "_config_data").toObject();
+    QString host = peer.value("hostName").toString();
+    QHostAddress numericHost;
+    if (numericHost.setAddress(host)) host = numericHost.toString();
+    if (protocol == QStringLiteral("xray")) {
+        // Mayak Xray path: no peer key; the service reports this fixed tag and the outbound
+        // endpoint of the xray client config (see AmneziaVpnService.launchXrayHealthSending).
+        const QJsonObject vnext = QJsonDocument::fromJson(peer.value("config").toString().toUtf8()).object()
+            .value("outbounds").toArray().first().toObject().value("settings").toObject()
+            .value("vnext").toArray().first().toObject();
+        QString xrayHost = vnext.value("address").toString();
+        if (numericHost.setAddress(xrayHost)) xrayHost = numericHost.toString();
+        m_expectedHealth = {QUuid::createUuid().toString(QUuid::WithoutBraces), QStringLiteral("78726179"),
+            AwgHealthContext::endpointForHost(xrayHost, vnext.value("port").toInt())};
+    } else
+    m_expectedHealth = {QUuid::createUuid().toString(QUuid::WithoutBraces),
+        QString::fromLatin1(QByteArray::fromBase64(peer.value("server_pub_key").toString().toLatin1()).toHex()),
+        AwgHealthContext::endpointForHost(host, peer.value("port").toInt())};
+    configured.insert("healthContextId", m_expectedHealth.id);
+    m_managedTicket = configured.value("managedTicket").toString();
+    auto config = QJsonDocument(configured).toJson();
     callActivityMethod("start", "(Ljava/lang/String;)V",
                        QJniObject::fromString(config).object<jstring>());
 
@@ -147,7 +185,61 @@ ErrorCode AndroidController::start(const QJsonObject &vpnConfig)
 
 void AndroidController::stop()
 {
+    m_expectedHealth = {};
     callActivityMethod("stop", "()V");
+}
+
+int AndroidController::installUpdateApk(const QString &path)
+{
+    auto pending = QNativeInterface::QAndroidApplication::runOnAndroidMainThread([path]() -> QVariant {
+        return static_cast<int>(callActivityMethod<jint>("installUpdateApk", "(Ljava/lang/String;)I",
+                        QJniObject::fromString(path).object<jstring>()));
+    }, QDeadlineTimer(5000));
+    pending.waitForFinished();
+    return pending.isCanceled() || pending.resultCount() == 0 ? UpdateInstallFailed : pending.result().toInt();
+}
+
+int AndroidController::scheduleBackgroundUpdate(const QString &path)
+{
+    auto pending = QNativeInterface::QAndroidApplication::runOnAndroidMainThread([path]() -> QVariant {
+        return static_cast<int>(callActivityMethod<jint>("scheduleBackgroundUpdate", "(Ljava/lang/String;)I",
+                        QJniObject::fromString(path).object<jstring>()));
+    }, QDeadlineTimer(5000));
+    pending.waitForFinished();
+    return pending.isCanceled() || pending.resultCount() == 0 ? 0 : pending.result().toInt();
+}
+
+int AndroidController::scheduleUpdateDownload(const QString &url, quint64 size, const QString &sha256, const QString &version)
+{
+    auto pending = QNativeInterface::QAndroidApplication::runOnAndroidMainThread([url, size, sha256, version]() -> QVariant {
+        return static_cast<int>(callActivityMethod<jint>("scheduleUpdateDownload",
+                        "(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;)I",
+                        QJniObject::fromString(url).object<jstring>(), static_cast<jlong>(size),
+                        QJniObject::fromString(sha256).object<jstring>(),
+                        QJniObject::fromString(version).object<jstring>()));
+    }, QDeadlineTimer(5000));
+    pending.waitForFinished();
+    return pending.isCanceled() || pending.resultCount() == 0 ? 0 : pending.result().toInt();
+}
+
+bool AndroidController::canInstallUpdates()
+{
+    return callActivityMethod<jboolean>("canInstallUpdates", "()Z");
+}
+
+void AndroidController::cancelBackgroundUpdate()
+{
+    callActivityMethod("cancelBackgroundUpdate", "()V");
+}
+
+void AndroidController::openInstallPermissionSettings()
+{
+    callActivityMethod("openInstallPermissionSettings", "()V");
+}
+
+void AndroidController::openVpnSystemSettings()
+{
+    callActivityMethod("openVpnSystemSettings", "()V");
 }
 
 void AndroidController::resetLastServer(int serverIndex)
@@ -280,6 +372,11 @@ void AndroidController::setScreenshotsEnabled(bool enabled)
 void AndroidController::setNavigationBarColor(unsigned int color)
 {
     callActivityMethod("setNavigationBarColor", "(I)V", color);
+}
+
+void AndroidController::setLightSystemBars(bool light)
+{
+    callActivityMethod("setLightSystemBars", "(Z)V", light);
 }
 
 void AndroidController::minimizeApp()
@@ -567,8 +664,8 @@ void AndroidController::onStatus(JNIEnv *env, jobject thiz, jint stateCode)
     Q_UNUSED(thiz);
 
     auto state = ConnectionState(stateCode);
-
-    emit AndroidController::instance()->status(state);
+    AndroidController *controller = AndroidController::instance();
+    emit controller->status(state);
 }
 
 // static
@@ -614,8 +711,8 @@ void AndroidController::onVpnStateChanged(JNIEnv *env, jobject thiz, jint stateC
     Q_UNUSED(thiz);
 
     auto state = ConnectionState(stateCode);
-
-    emit AndroidController::instance()->vpnStateChanged(state);
+    AndroidController *controller = AndroidController::instance();
+    emit controller->vpnStateChanged(state);
 }
 
 // static
@@ -625,6 +722,29 @@ void AndroidController::onStatisticsUpdate(JNIEnv *env, jobject thiz, jlong rxBy
     Q_UNUSED(thiz);
 
     emit AndroidController::instance()->statisticsUpdated((quint64) rxBytes, (quint64) txBytes);
+}
+
+// static
+void AndroidController::onAwgTunnelHealth(JNIEnv *env, jobject thiz, jstring snapshotJson)
+{
+    Q_UNUSED(thiz);
+    AndroidController *controller = AndroidController::instance();
+    const QString payload = AndroidUtils::convertJString(env, snapshotJson);
+    const QJsonDocument document = QJsonDocument::fromJson(payload.toUtf8());
+    if (!document.isObject()) return;
+    const AwgTunnelHealth health = AwgTunnelHealth::fromJson(document.object());
+    // Never read the expected activation/state on the Java callback thread.
+    QMetaObject::invokeMethod(controller, [controller, health] {
+        controller->receiveAwgTunnelHealth(health);
+    }, Qt::QueuedConnection);
+}
+
+void AndroidController::receiveAwgTunnelHealth(const AwgTunnelHealth& health)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (m_vpnState != ConnectionState::CONNECTED && m_vpnState != ConnectionState::CONNECTING) return;
+    if (!m_expectedHealth.matches(health)) return;
+    emit awgTunnelHealthUpdated(health);
 }
 
 // static
@@ -706,3 +826,166 @@ void AndroidController::onActivityResumed(JNIEnv *env, jobject thiz)
 }
 
 
+
+void AndroidController::prepareManagedPermissions(const QString &requestId, ManagedPermissionDone done) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (requestId.isEmpty() || !done || m_permissionPreflightCallbacks.contains(requestId)) {
+        if (done) done(requestId, ManagedPermissionResult::Unavailable);
+        return;
+    }
+    QJniObject activity = AndroidUtils::getActivity();
+    if (!activity.isValid()) { done(requestId, ManagedPermissionResult::Unavailable); return; }
+    m_permissionPreflightCallbacks.insert(requestId, std::move(done));
+    activity.callMethod<void>("prepareManagedPermissionPreflight", "(Ljava/lang/String;)V",
+                              QJniObject::fromString(requestId).object<jstring>());
+    if (QJniEnvironment().checkAndClearExceptions()) {
+        const auto callback = m_permissionPreflightCallbacks.take(requestId);
+        if (callback) callback(requestId, ManagedPermissionResult::Unavailable);
+    }
+}
+
+void AndroidController::cancelManagedPermissionPreparation(const QString &requestId) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    m_permissionPreflightCallbacks.remove(requestId);
+    QJniObject activity = AndroidUtils::getActivity();
+    if (!activity.isValid()) return;
+    activity.callMethod<void>("cancelManagedPermissionPreflight", "(Ljava/lang/String;)V",
+                              QJniObject::fromString(requestId).object<jstring>());
+    QJniEnvironment().checkAndClearExceptions();
+}
+
+void AndroidController::onManagedPermissionPreflightResult(JNIEnv *env, jobject, jstring jRequestId, jint result) {
+    const QString requestId = AndroidUtils::convertJString(env, jRequestId);
+    ManagedPermissionResult status = ManagedPermissionResult::Unavailable;
+    if (result == static_cast<jint>(ManagedPermissionResult::Ready)) status = ManagedPermissionResult::Ready;
+    else if (result == static_cast<jint>(ManagedPermissionResult::Denied)) status = ManagedPermissionResult::Denied;
+    auto *controller = instance();
+    QMetaObject::invokeMethod(controller, [controller, requestId, status] {
+        const auto callback = controller->m_permissionPreflightCallbacks.take(requestId);
+        if (callback) callback(requestId, status);
+    }, Qt::QueuedConnection);
+}
+
+void AndroidController::cancelManaged(const QString& ticket) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    callActivityMethod("cancelManaged", "(Ljava/lang/String;)V", QJniObject::fromString(ticket).object<jstring>());
+}
+void AndroidController::managedStop(const QString& request, const QString& context, const QString& ticket) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    m_managedStops.insert(request, context);
+    qInfo() << "MayakManagedStop dispatch=invoked";
+    callActivityMethod("managedStop", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        QJniObject::fromString(request).object<jstring>(), QJniObject::fromString(context).object<jstring>(),
+        QJniObject::fromString(ticket).object<jstring>());
+}
+void AndroidController::managedInspect(const QString& request) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    m_managedInspections.insert(request);
+    callActivityMethod("managedInspect", "(Ljava/lang/String;)V", QJniObject::fromString(request).object<jstring>());
+}
+void AndroidController::managedRecover(const QString& request, const QString& context, const QString& ticket) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    m_managedRecovers.insert(request, context);
+    qInfo() << "MayakNet event=recover_dispatch";
+    callActivityMethod("managedRecover", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        QJniObject::fromString(request).object<jstring>(), QJniObject::fromString(context).object<jstring>(),
+        QJniObject::fromString(ticket).object<jstring>());
+}
+void AndroidController::managedAdopt(const QString& request, const AwgHealthContext& expected, const QString& ticket) {
+    Q_ASSERT(QThread::currentThread() == thread());
+    m_managedAdopts.insert(request, {expected, ticket});
+    qInfo() << "MayakNet event=adopt_dispatch";
+    callActivityMethod("managedAdopt", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        QJniObject::fromString(request).object<jstring>(), QJniObject::fromString(expected.id).object<jstring>(),
+        QJniObject::fromString(ticket).object<jstring>());
+}
+void AndroidController::onManagedLifecycle(JNIEnv*, jobject, jstring resultJson) {
+    const QJsonDocument document = QJsonDocument::fromJson(QJniObject(resultJson).toString().toUtf8());
+    if (!document.isObject()) { qInfo() << "MayakManagedStopAck accepted=false reason=shape"; return; }
+    const QJsonObject obj = document.object();
+    auto* controller = instance();
+    QMetaObject::invokeMethod(controller, [controller, obj] {
+        if (obj.value("owner").toString() != "MayakVpnAwgLifecycleV1") {
+            if (obj.value("type").toString() == "managedStopped")
+                qInfo() << "MayakManagedStopAck accepted=false reason=owner";
+            return;
+        }
+        const QString type = obj.value("type").toString();
+        if (type == "managedStopped") {
+            const QString request = obj.value("stopRequestId").toString();
+            const QString context = obj.value("healthContextId").toString();
+            const bool stoppedShape = obj.value("stopped").isBool();
+            const bool requestMatch = controller->m_managedStops.contains(request);
+            const bool contextMatch = requestMatch && controller->m_managedStops.value(request) == context;
+            if (!stoppedShape || !requestMatch || !contextMatch) {
+                qInfo() << "MayakManagedStopAck accepted=false stopped_shape=" << stoppedShape
+                        << "request_match=" << requestMatch << "context_match=" << contextMatch;
+                return;
+            }
+            controller->m_managedStops.remove(request);
+            const bool stopped = obj.value("stopped").toBool();
+            if (stopped && controller->m_expectedHealth.id == context) controller->m_expectedHealth = {};
+            qInfo() << "MayakManagedStopAck accepted=true stopped=" << stopped;
+            emit controller->managedStopped(request, context, stopped);
+        } else if (type == "managedInspection") {
+            const QString request = obj.value("inspectRequestId").toString();
+            if (!controller->m_managedInspections.remove(request)) return;
+            emit controller->managedInspected(request, obj.value("state").toString(), obj.value("controlIdentity").toString());
+        } else if (type == "managedDenied") {
+            const QString ticket = obj.value("ticket").toString();
+            const QString context = obj.value("healthContextId").toString();
+            if (ticket != controller->m_managedTicket || context != controller->m_expectedHealth.id) return;
+            controller->m_expectedHealth = {};
+            emit controller->managedDenied(ticket, context);
+        } else if (type == "managedRecovered") {
+            const QString request = obj.value("recoverRequestId").toString();
+            const QString context = obj.value("healthContextId").toString();
+            if (!obj.value("recovered").isBool() || !controller->m_managedRecovers.contains(request) ||
+                controller->m_managedRecovers.value(request) != context) return;
+            controller->m_managedRecovers.remove(request);
+            emit controller->managedRecovered(request, context, obj.value("recovered").toBool());
+        } else if (type == "managedNetwork") {
+            const QString context = obj.value("healthContextId").toString();
+            const QString state = obj.value("state").toString();
+            if (context.isEmpty() || context != controller->m_expectedHealth.id) return;
+            if (state == "network_validated") emit controller->managedNetworkChanged(context, true);
+            else if (state == "network_lost") emit controller->managedNetworkChanged(context, false);
+        } else if (type == "managedAdopted") {
+            const QString request = obj.value("adoptRequestId").toString();
+            const QString context = obj.value("healthContextId").toString();
+            if (!obj.value("adopted").isBool() || !controller->m_managedAdopts.contains(request) ||
+                controller->m_managedAdopts.value(request).expected.id != context) return;
+            const auto pending = controller->m_managedAdopts.take(request);
+            const bool adopted = obj.value("adopted").toBool();
+            if (adopted) {
+                // From now on health/network/resume events of this context belong to the owner.
+                controller->m_expectedHealth = pending.expected;
+                controller->m_managedTicket = pending.ticket;
+                controller->isWaitingStatus = false;
+            }
+            qInfo() << "MayakNet event=adopt_result adopted=" << adopted;
+            emit controller->managedAdopted(request, context, adopted);
+        } else if (type == "managedUserStop") {
+            const QString context = obj.value("healthContextId").toString();
+            if (context.isEmpty() || context != controller->m_expectedHealth.id) return;
+            qInfo() << "MayakNet event=user_stop source=system_ui";
+            emit controller->managedUserStopped(context);
+        } else if (type == "managedFailover") {
+            // The service watchdog could not repair the current exit while the UI was hidden.
+            const QString context = obj.value("healthContextId").toString();
+            if (context.isEmpty() || context != controller->m_expectedHealth.id) return;
+            qInfo() << "MayakNet event=failover_request source=service";
+            emit controller->managedFailoverRequested(context);
+        } else if (type == "connectRequest") {
+            qInfo() << "MayakNet event=connect_request source=system_ui";
+            controller->m_connectRequestPending = true;
+            emit controller->connectRequested();
+        } else if (type == "managedResume") {
+            const QString context = obj.value("healthContextId").toString();
+            if (context.isEmpty() || context != controller->m_expectedHealth.id ||
+                !obj.value("backendReplaced").isBool() || !obj.value("networkAvailable").isBool()) return;
+            emit controller->managedResumed(context, obj.value("backendReplaced").toBool(),
+                                            obj.value("networkAvailable").toBool());
+        }
+    }, Qt::QueuedConnection);
+}

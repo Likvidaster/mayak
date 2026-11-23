@@ -56,11 +56,12 @@ PageType {
                 Layout.leftMargin: 16
                 Layout.rightMargin: 16
 
-                text: qsTr("Servers")
-                icon.source: "qrc:/images/controls/server.svg"
+                text: qsTr("Аккаунт Маяка")
+                subtitle: MayakInviteController.hasSession ? qsTr("Вход выполнен · устройства, Telegram") : qsTr("Войти или создать аккаунт")
+                icon.source: "qrc:/images/controls/mail.svg"
                 trailingIconSource: "qrc:/images/controls/chevron-right.svg"
 
-                onClicked: PageController.goToPage(PageEnum.PageSettingsServersList)
+                onClicked: PageController.goToPage(PageEnum.PageMayakInvite)
             }
 
             ListItemType {
@@ -124,7 +125,7 @@ PageType {
                 Layout.rightMargin: 16
 
                 text: qsTr("About Mayak VPN")
-                icon.source: "qrc:/images/controls/amnezia.svg"
+                icon.source: "qrc:/images/controls/info.svg"
                 trailingIconSource: "qrc:/images/controls/chevron-right.svg"
 
                 onClicked: PageController.goToPage(PageEnum.PageSettingsAbout)

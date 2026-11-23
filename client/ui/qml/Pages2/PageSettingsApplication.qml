@@ -44,6 +44,34 @@ PageType {
                 spacing: 0
 
                 ListItemType {
+                    id: appearanceRow
+                    Layout.fillWidth: true
+                    text: qsTr("Дневная тема")
+                    subtitle: qsTr("Изменить цветовое оформление приложения")
+                    SwitchType {
+                        id: appearanceSwitch
+                        objectName: "mayak-theme-setting"
+                        focusPolicy: Qt.NoFocus
+                        checked: AmneziaStyle.mayakDay
+                        onToggled: AmneziaStyle.mayakDay = checked
+                    }
+                }
+
+                ListItemType {
+                    id: reducedMotionRow
+                    Layout.fillWidth: true
+                    text: qsTr("Уменьшить движение")
+                    subtitle: qsTr("Отключить декоративную анимацию")
+                    SwitchType {
+                        id: reducedMotionSwitch
+                        objectName: "mayak-reduced-motion-setting"
+                        focusPolicy: Qt.NoFocus
+                        checked: AmneziaStyle.mayakReduceMotion
+                        onToggled: AmneziaStyle.mayakReduceMotion = checked
+                    }
+                }
+
+                ListItemType {
                     id: switcherAllowScreenshotsRow
 
                     Layout.fillWidth: true
@@ -229,6 +257,58 @@ PageType {
                             }
                         }
                     }
+                }
+
+                ListItemType {
+                    id: switcherAutoUpdateRow
+
+                    Layout.fillWidth: true
+                    visible: UpdateController.isUpdateSupported && !UpdateController.isStoreUpdate
+
+                    text: "Обновлять автоматически"
+                    subtitle: Qt.platform.os === "android"
+                              ? "Скачивать по Wi‑Fi и ставить, когда телефон не используется. AmneziaWG вернётся сам, для Xray придёт уведомление «Подключить»."
+                              : "Скачивать и ставить, когда компьютер не используется. На время установки интернет отключается, затем VPN подключится снова."
+
+                    onClicked: {
+                        switcherAutoUpdate.toggle()
+                        switcherAutoUpdate.toggled()
+                    }
+
+                    SwitchType {
+                        id: switcherAutoUpdate
+
+                        focusPolicy: Qt.NoFocus
+
+                        checked: UpdateController.autoUpdateEnabled
+                        onToggled: function() {
+                            if (checked !== UpdateController.autoUpdateEnabled) {
+                                UpdateController.autoUpdateEnabled = checked
+                            }
+                        }
+                    }
+                }
+
+                ListItemType {
+                    Layout.fillWidth: true
+                    visible: Qt.platform.os === "android" && UpdateController.needsInstallPermission
+
+                    text: "Разрешить установку обновлений"
+                    subtitle: "Нужно один раз, чтобы Маяк мог обновляться сам"
+                    trailingIconSource: "qrc:/images/controls/chevron-right.svg"
+
+                    onClicked: UpdateController.openInstallPermissionSettings()
+                }
+
+                ListItemType {
+                    Layout.fillWidth: true
+                    visible: Qt.platform.os === "android" && UpdateController.autoUpdateEnabled
+
+                    text: "Без интернета мимо VPN"
+                    subtitle: "Включите для Маяка «Постоянный VPN» и «Блокировать подключения без VPN»: тогда и во время обновления трафик не пойдёт мимо VPN"
+                    trailingIconSource: "qrc:/images/controls/chevron-right.svg"
+
+                    onClicked: UpdateController.openVpnSystemSettings()
                 }
 
                 ListItemType {

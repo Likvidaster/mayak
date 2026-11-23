@@ -14,7 +14,7 @@ Text {
         return root.verticalAlignment === Text.AlignBottom ? extra : 0
     }
 
-    lineHeight: 18 + LanguageUiController.getLineHeightAppend()
+    lineHeight: 21 + LanguageUiController.getLineHeightAppend()
     lineHeightMode: Text.FixedHeight
 
     topPadding: root.halfLeading + root.alignmentShift
@@ -23,7 +23,7 @@ Text {
     color: AmneziaStyle.color.textTertiary
     font.pixelSize: 14
     font.weight: 400
-    font.family: "PT Root UI VF"
+    font.family: AmneziaStyle.uiFontFamily
     font.letterSpacing: 0
     font.features: { "ss08": 1, "ss09": 1, "lnum": 1, "tnum": 1 }
 

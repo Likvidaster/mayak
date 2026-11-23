@@ -51,6 +51,8 @@ set(HEADERS ${HEADERS}
     ${CLIENT_ROOT_DIR}/core/controllers/api/subscriptionController.h
     ${CLIENT_ROOT_DIR}/core/controllers/api/newsController.h
     ${CLIENT_ROOT_DIR}/core/controllers/updateController.h
+    ${CLIENT_ROOT_DIR}/core/utils/signedUpdateManifest.h
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakWindowsAutoUpdater.h
     ${CLIENT_ROOT_DIR}/core/repositories/secureServersRepository.h
     ${CLIENT_ROOT_DIR}/core/repositories/secureAppSettingsRepository.h
     ${CLIENT_ROOT_DIR}/core/protocols/qmlRegisterProtocols.h
@@ -141,6 +143,8 @@ set(SOURCES ${SOURCES}
     ${CLIENT_ROOT_DIR}/core/controllers/api/subscriptionController.cpp
     ${CLIENT_ROOT_DIR}/core/controllers/api/newsController.cpp
     ${CLIENT_ROOT_DIR}/core/controllers/updateController.cpp
+    ${CLIENT_ROOT_DIR}/core/utils/signedUpdateManifest.cpp
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakWindowsAutoUpdater.cpp
     ${CLIENT_ROOT_DIR}/core/repositories/secureServersRepository.cpp
     ${CLIENT_ROOT_DIR}/core/repositories/secureAppSettingsRepository.cpp
     ${CLIENT_ROOT_DIR}/ui/utils/qAutoStart.cpp
@@ -213,6 +217,26 @@ set(COMMON_FILES_CPP
     ${CLIENT_ROOT_DIR}/amneziaApplication.cpp
     ${CLIENT_ROOT_DIR}/secureQSettings.cpp
     ${CLIENT_ROOT_DIR}/vpnConnection.cpp
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakBackendBridge.h
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakBackendBridge.cpp
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakAutoConnectRuntime.h
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakAutoConnectRuntime.cpp
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakAutoConnectCoordinator.h
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakAutoConnectCoordinator.cpp
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakAttemptStore.h
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakAttemptStore.cpp
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakForeignVpn.h
+    ${CLIENT_ROOT_DIR}/core/controllers/mayakForeignVpn.cpp
+    ${CLIENT_ROOT_DIR}/core/controllers/api/mayakAdmissionClient.h
+    ${CLIENT_ROOT_DIR}/core/controllers/api/mayakAdmissionClient.cpp
+    ${CLIENT_ROOT_DIR}/core/utils/mayakTunnelProbe.h
+    ${CLIENT_ROOT_DIR}/core/utils/mayakTunnelProbe.cpp
+    ${CLIENT_ROOT_DIR}/core/utils/mayakSplitTunneling.h
+    ${CLIENT_ROOT_DIR}/core/utils/mayakSplitTunneling.cpp
+    ${CLIENT_ROOT_DIR}/core/utils/mayakDeviceIdentity.h
+    ${CLIENT_ROOT_DIR}/core/utils/mayakDeviceIdentity.cpp
+    ${CLIENT_ROOT_DIR}/core/utils/mayakTunnelInterfaceResolver.h
+    ${CLIENT_ROOT_DIR}/core/utils/mayakTunnelInterfaceResolver.cpp
 )
 
 file(GLOB_RECURSE PAGE_LOGIC_H CONFIGURE_DEPENDS ${CLIENT_ROOT_DIR}/ui/pages_logic/*.h)

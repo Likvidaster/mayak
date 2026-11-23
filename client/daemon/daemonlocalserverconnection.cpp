@@ -13,6 +13,12 @@
 #include "leakdetector.h"
 #include "logger.h"
 
+#if defined(MZ_WINDOWS)
+#  include "platforms/windows/daemon/mayakforeignvpnstop.h"
+#  include "platforms/windows/daemon/mayakwintunheal.h"
+#  include "platforms/windows/daemon/mayakupdateapply.h"
+#endif
+
 namespace {
 Logger logger("DaemonLocalServerConnection");
 }
@@ -111,12 +117,91 @@ void DaemonLocalServerConnection::parseCommand(const QByteArray& data) {
       return;
     }
 
-    if (!Daemon::instance()->activate(config)) {
+    if (!Daemon::instance()->activateWithHealthContext(config, obj.value("healthContextId").toString())) {
       logger.error() << "Failed to activate the interface";
       emit disconnected();
     }
     return;
   }
+
+  if (type == "managedDeactivate") {
+    const QString request = obj.value("stopRequestId").toString();
+    const QString context = obj.value("healthContextId").toString();
+    if (request.size() != 64 || context.isEmpty()) return;
+    const bool stopped = Daemon::instance()->managedDeactivate(context);
+    write(QJsonObject{{"type", "managedStopped"}, {"owner", "MayakVpnAwgLifecycleV1"},
+        {"stopRequestId", request}, {"healthContextId", context}, {"stopped", stopped}});
+    return;
+  }
+  if (type == "managedInspect") {
+    const QString request = obj.value("inspectRequestId").toString();
+    if (request.size() != 64) return;
+    auto result = Daemon::instance()->managedInspection();
+    result.insert("type", "managedInspection");
+    result.insert("owner", "MayakVpnAwgLifecycleV1");
+    result.insert("inspectRequestId", request);
+    write(result);
+    return;
+  }
+
+#if defined(MZ_WINDOWS)
+  // Mayak: the user pressed "turn off Browsec" in the app. Only fixed, known cores are ended.
+  if (type == "mayakStopForeignVpn") {
+    const QString request = obj.value("requestId").toString();
+    if (request.size() != 64) return;
+    const int stopped = MayakForeignVpnStop::stopKnownCores();
+    write(QJsonObject{{"type", "mayakForeignVpnStopped"}, {"owner", "MayakVpnAwgLifecycleV1"},
+        {"requestId", request}, {"stopped", stopped}});
+    return;
+  }
+  // Mayak: prepare app exclusions before a connect (may take seconds: AmneziaVPN's copy of the split tunnel
+  // driver is released for Mayak when it holds the device and runs no VPN).
+  if (type == "mayakPrepareSplitTunnel") {
+    const QString request = obj.value("requestId").toString();
+    if (request.size() != 64) return;
+    const QString result = Daemon::instance()->mayakPrepareSplitTunnel();
+    write(QJsonObject{{"type", "mayakSplitTunnelPrepared"}, {"owner", "MayakVpnAwgLifecycleV1"},
+        {"requestId", request}, {"result", result}});
+    return;
+  }
+  // Mayak automatic update: install a verified newer Mayak in the background (the service verifies
+  // the signed feed envelope and the package itself; see mayakupdateapply.h).
+  if (type == "mayakApplyUpdate") {
+    const QString request = obj.value("requestId").toString();
+    if (request.size() != 64) return;
+    const QByteArray envelope = QByteArray::fromBase64(obj.value("envelope").toString().toLatin1());
+    const QString result = MayakUpdateApply::apply(envelope, obj.value("package").toString(), obj.value("vpnWasOn").toBool(),
+                                                   reinterpret_cast<void*>(m_socket->socketDescriptor()));
+    write(QJsonObject{{"type", "mayakUpdateApplying"}, {"owner", "MayakVpnAwgLifecycleV1"},
+        {"requestId", request}, {"result", result}});
+    return;
+  }
+  // Mayak automatic update: the new app reconnected; the update guard lifts its traffic block.
+  if (type == "mayakUpdateConnected") {
+    MayakUpdateApply::signalConnected();
+    return;
+  }
+  // Mayak: Windows refused to create Mayak's tunnel adapter on the last start; repair the WinTun
+  // state with one temporary adapter (never while Mayak's tunnel service runs).
+  if (type == "mayakHealWintun") {
+    const QString request = obj.value("requestId").toString();
+    if (request.size() != 64) return;
+    const QString result = MayakWintunHeal::run();
+    write(QJsonObject{{"type", "mayakWintunHealed"}, {"owner", "MayakVpnAwgLifecycleV1"},
+        {"requestId", request}, {"result", result}});
+    return;
+  }
+  // Mayak: the app found its own Xray tunnel left by an ended app process. Ends only tun2socks
+  // started from this installation's tun2socks.exe.
+  if (type == "mayakStopXrayLeftover") {
+    const QString request = obj.value("requestId").toString();
+    if (request.size() != 64) return;
+    const int stopped = MayakForeignVpnStop::stopOwnTun2Socks();
+    write(QJsonObject{{"type", "mayakXrayLeftoverStopped"}, {"owner", "MayakVpnAwgLifecycleV1"},
+        {"requestId", request}, {"stopped", stopped}});
+    return;
+  }
+#endif
 
   if (type == "deactivate") {
     Daemon::instance()->deactivate(true);
@@ -124,9 +209,10 @@ void DaemonLocalServerConnection::parseCommand(const QByteArray& data) {
   }
 
   if (type == "status") {
-    QJsonObject obj = Daemon::instance()->getStatus();
-    obj.insert("type", "status");
-    write(obj);
+    QJsonObject status = Daemon::instance()->getStatus();
+    status.insert("type", "status");
+    status.insert("statusRequestId", obj.value("statusRequestId"));
+    write(status);
     return;
   }
 

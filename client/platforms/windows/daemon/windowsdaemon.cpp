@@ -8,6 +8,7 @@
 #include <qassert.h>
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -23,6 +24,7 @@
 #include "platforms/windows/daemon/windowsfirewall.h"
 #include "platforms/windows/daemon/windowssplittunnel.h"
 #include "windowsfirewall.h"
+#include "mayakforeignvpnstop.h"
 
 #include "core/utils/networkUtilities.h"
 
@@ -61,7 +63,36 @@ void WindowsDaemon::prepareActivation(const InterfaceConfig& config, int inetAda
   }
 }
 
+QString WindowsDaemon::mayakPrepareSplitTunnel() {
+  if (m_splitTunnelManager) return QStringLiteral("ok");
+  // Only a real Mullvad installation is "mullvad". WindowsSplitTunnel::detectConflict() also reports a device
+  // taken by AmneziaVPN while Mayak's driver is unregistered (every Mayak service stop unregisters it), which is
+  // exactly the case the release below fixes; create() runs that check again after the release.
+  if (MayakForeignVpnStop::mullvadInstalled()) return QStringLiteral("mullvad");
+  const auto amnezia = MayakForeignVpnStop::amneziaSplitTunnelState();
+  if (amnezia.driverRunning && amnezia.vpnActive) return QStringLiteral("amnezia_active");
+  if (amnezia.driverRunning && amnezia.servicePending) return QStringLiteral("amnezia_busy");
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  const bool recentlyFailed = m_splitTunnelTakeoverFailedAt && now - m_splitTunnelTakeoverFailedAt < 10 * 60 * 1000;
+  MayakForeignVpnStop::AmneziaSplitTunnelRelease released;
+  // Release AmneziaVPN's copy only when Mayak's own copy is installed and can take the device.
+  if (amnezia.driverRunning && !recentlyFailed && MayakForeignVpnStop::mayakDriverFileExists())
+    released = MayakForeignVpnStop::releaseAmneziaSplitTunnel();
+  m_splitTunnelManager = WindowsSplitTunnel::create(m_firewallManager);
+  if (released.serviceStopRequested) MayakForeignVpnStop::restartAmneziaService();
+  if (!m_splitTunnelManager && amnezia.driverRunning) m_splitTunnelTakeoverFailedAt = now;
+  logger.info() << QStringLiteral("MayakNet event=split_tunnel_prepare amnezia_driver=%1 released=%2 ok=%3")
+                       .arg(amnezia.driverRunning ? 1 : 0).arg(released.driverStopped ? 1 : 0).arg(m_splitTunnelManager ? 1 : 0);
+  if (m_splitTunnelManager) return QStringLiteral("ok");
+  return amnezia.driverRunning ? QStringLiteral("amnezia_holds") : QStringLiteral("unavailable");
+}
+
+bool WindowsDaemon::ensureSplitTunnel() {
+  return m_splitTunnelManager != nullptr || mayakPrepareSplitTunnel() == QStringLiteral("ok");
+}
+
 void WindowsDaemon::activateSplitTunnel(const InterfaceConfig& config, int vpnAdapterIndex) {
+    if (m_splitTunnelManager == nullptr && config.m_vpnDisabledApps.length() > 0) ensureSplitTunnel();
     if (m_splitTunnelManager == nullptr) {
         if (config.m_vpnDisabledApps.length() > 0) {
             logger.error() << "Split tunnel manager is not initialized";
@@ -85,12 +116,17 @@ void WindowsDaemon::activateSplitTunnel(const InterfaceConfig& config, int vpnAd
           logger.error() << "Split tunnel did not reach running state";
           emit backendFailure(DaemonError::ERROR_SPLIT_TUNNEL_START_FAILURE);
       }
-  } else {
-      m_splitTunnelManager->stop();
+  } else if (!m_splitTunnelManager->stop()) {
+      logger.error() << "Failed to stop split tunnel";
+      emit backendFailure();
   }
 }
 
 bool WindowsDaemon::run(Op op, const InterfaceConfig& config) {
+  // Mayak: without the driver nothing was excluded, so there is nothing to undo. Failing Down here left the
+  // service in an uncertain teardown forever ("Служба VPN не отвечает" until the service restarted).
+  if (!m_splitTunnelManager && op == Down) return true;
+  if (!m_splitTunnelManager && config.m_vpnDisabledApps.length() > 0) ensureSplitTunnel();
   if (!m_splitTunnelManager) {
     if (config.m_vpnDisabledApps.length() > 0) {
       // The Client has sent us a list of disabled apps, but we failed
@@ -104,8 +140,7 @@ bool WindowsDaemon::run(Op op, const InterfaceConfig& config) {
   }
 
   if (op == Down) {
-    m_splitTunnelManager->stop();
-    return true;
+    return m_splitTunnelManager->stop();
   }
   if (config.m_vpnDisabledApps.length() > 0) {
     if (!m_splitTunnelManager->start(m_inetAdapterIndex)) {
@@ -126,9 +161,7 @@ bool WindowsDaemon::run(Op op, const InterfaceConfig& config) {
     }
     return true;
   }
-  m_splitTunnelManager->stop();
-
-  return true;
+  return m_splitTunnelManager->stop();
 }
 
 void WindowsDaemon::monitorBackendFailure() {
