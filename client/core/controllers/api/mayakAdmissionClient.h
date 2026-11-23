@@ -29,6 +29,9 @@ struct ConnectionCapability {
     qint64 revision = 0;
     QDateTime expiresAt;
     QList<Candidate> candidates;
+    // Optional (server of 23.11.2026): until when this device may connect from its stored exits
+    // without an answer from the gateway. Invalid/absent = unknown (the client uses its own bound).
+    QDateTime offlineUntil;
 };
 
 struct AdmissionError {
@@ -113,6 +116,9 @@ struct Request {
     bool resumeAllocation = false;
     // acquire only: ask for the Xray paths of the same exit (mayak_paths=1).
     bool requestPaths = false;
+    // acquire only: the tunnel already runs from the stored exit (no gateway answer at connect time);
+    // the server records the place even over capacity and closes an older open place (JSON true).
+    bool late = false;
 };
 
 using Transport = std::function<QFuture<GatewayPostResult>(const QString &, const QJsonObject &, int)>;

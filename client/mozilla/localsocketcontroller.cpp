@@ -333,7 +333,6 @@ void LocalSocketController::inspectOwnBackend(const QString& request) {
 }
 
 void LocalSocketController::checkStatus() {
-  logger.debug() << "Check status";
 
   if (m_daemonState == eReady || m_daemonState == eInitializing) {
     Q_ASSERT(m_socket);
@@ -390,7 +389,6 @@ void LocalSocketController::cleanupBackendLogs() {
 }
 
 void LocalSocketController::readData() {
-  logger.debug() << "Reading";
 
   Q_ASSERT(m_socket);
   Q_ASSERT(m_daemonState == eInitializing || m_daemonState == eReady);
@@ -438,7 +436,8 @@ void LocalSocketController::parseCommand(const QByteArray& command) {
   }
   QString type = typeValue.toString();
 
-  logger.debug() << "Parse command:" << type;
+  // Mayak: the once-a-second status poll is not logged (it filled the log with ~25 MB a day).
+  if (type != "status") logger.debug() << "Parse command:" << type;
 
   if (type == "managedStopped") {
     const QString request = obj.value("stopRequestId").toString();

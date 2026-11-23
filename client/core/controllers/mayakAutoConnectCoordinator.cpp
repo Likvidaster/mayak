@@ -137,7 +137,7 @@ void Coordinator::onFetch(CycleId c, AttemptId a, FetchStatus result, Snapshot s
         fail(ErrorCategory::Malformed); return;
     }
     // The 30 s selection budget starts once a fresh candidate snapshot exists.
-    snapshotExpiresAt_ = snapshot.expiresAt;
+    snapshotExpiresAt_ = std::min(snapshot.expiresAt, now + timing().cycleCeilingMs);
     overallDeadline_ = std::min(now + timing().cycleMs, snapshotExpiresAt_);
     std::unordered_set<std::string> ids, ips;
     for (const auto& candidate : snapshot.candidates) {
@@ -157,6 +157,11 @@ void Coordinator::onFetch(CycleId c, AttemptId a, FetchStatus result, Snapshot s
 
 void Coordinator::tryNext() {
     if (clock_.now() >= snapshotExpiresAt_) { fail(ErrorCategory::Deadline); return; }
+    // Mayak 5.1.0.28: every further exit gets its own selection budget, so an exit that used up the
+    // AWG and Xray time no longer leaves the next exits of the snapshot untried (review 02, item 2:
+    // on Windows one exit took the whole 50 s). The snapshot's own expiry still bounds the cycle.
+    if (nextCandidate_ > 0 && nextCandidate_ < candidates_.size())
+        overallDeadline_ = std::min(snapshotExpiresAt_, clock_.now() + timing().cycleMs);
     if (clock_.now() >= overallDeadline_) { fail(ErrorCategory::Deadline); return; }
     if (nextCandidate_ >= candidates_.size()) { fail(pendingError_ == ErrorCategory::None ? ErrorCategory::Network : pendingError_); return; }
     currentCandidate_ = candidates_[nextCandidate_++].candidate;

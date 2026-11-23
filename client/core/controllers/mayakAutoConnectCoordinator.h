@@ -116,6 +116,9 @@ struct Timing {
     Millis awgVerifyMs = 6000;       // handshake + probe after Started
     Millis xrayVerifyMs = 8000;      // probe through the Xray tunnel after Started
     Millis raceMs = 6000;            // parallel check of the Xray paths
+    // 5.1.0.28: every exit has its own budget (see tryNext); the whole cycle over all exits of one
+    // snapshot still ends after this, then the usual retry/error path takes over.
+    Millis cycleCeilingMs = 120000;
     Millis stopMs = 3000;
 };
 

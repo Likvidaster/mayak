@@ -18,6 +18,7 @@
 #include <QUuid>
 #include "core/utils/mayakTunnelProbe.h"
 #include "core/controllers/mayakAutoConnectRuntime.h"
+#include "logger.h"
 #include "version.h"
 #include "core/controllers/mayakAutoConnectCoordinator.h"
 #include "core/controllers/mayakAttemptStore.h"
@@ -476,8 +477,48 @@ struct World : QObject {
     bool refuseProven=false; // the server answers "proven": false
     bool errorProven=false;  // the server answers "proven" with an admission error
     int provenCalls=0;
+    // Connect without the gateway (review 01, item 2): the gateway never answers anything while
+    // `gatewayDown`; v1/config answers after `configDelay` ms; a late acquire answers by `lateMode`
+    // (0 place, 1 no answer, 2 REVOKED, 3 NOT_READY, 4 INVALID_REQUEST).
+    bool gatewayDown=false; int configDelay=0; int lateMode=0; int lateAcquires=0;
+    QJsonObject offlineMemory() const { return QJsonDocument::fromJson(const_cast<SecureQSettings&>(settings).value("Mayak/offlineMemory").toByteArray()).object(); }
+    int deferredCleanups() const { return int(QJsonDocument::fromJson(const_cast<SecureQSettings&>(settings).value("Mayak/deferredCleanup").toByteArray()).array().size()); }
+    // The pre-23.11 cleanup tests: no stored exits, so an unanswered release/reconcile keeps the
+    // manual "retry the disconnect" path (the stored-exit deferral needs a usable memory).
+    bool noOfflineMemory=false;
+    QJsonObject configError;          // v1/config answers this signed error instead of the capability
+    bool invalidNextAcquire=false;    // the next normal acquire: INVALID_REQUEST (an older place is open)
+    bool refuseReconcile=false;       // reconcile answers "reconciled": false
     QFuture<GatewayPostResult> transport(QString path,QJsonObject payload) {
         requestPayloads.append(payload);
+        if (noOfflineMemory) settings.remove("Mayak/offlineMemory");
+        if (gatewayDown) {
+            events<<"gateway_down";
+            auto promise=std::make_shared<QPromise<GatewayPostResult>>(); promise->start(); auto future=promise->future();
+            allTransportPromises.append(promise);
+            QTimer::singleShot(5,this,[promise]{ if (promise->future().isFinished()) return;
+                promise->addResult({ErrorCode::ApiConfigDownloadError,{},false}); promise->finish(); });
+            return future;
+        }
+        if (payload.value("action").toString()=="acquire" && payload.value("late").isBool() && payload.value("late").toBool()) {
+            ++lateAcquires; events<<"late_acquire";
+            auto promise=std::make_shared<QPromise<GatewayPostResult>>(); promise->start(); auto future=promise->future();
+            allTransportPromises.append(promise);
+            if (lateMode==1) {
+                QTimer::singleShot(5,this,[promise]{ if (promise->future().isFinished()) return;
+                    promise->addResult({ErrorCode::ApiConfigTimeoutError,{},false}); promise->finish(); });
+                return future;
+            }
+            QJsonObject response;
+            if (lateMode==2) response={{"http_status",403},{"code","REVOKED"},{"message","REVOKED"}};
+            else if (lateMode==3) response={{"http_status",409},{"code","NOT_READY"},{"message","not ready"}};
+            else if (lateMode==4) response={{"http_status",400},{"code","INVALID_REQUEST"},{"message","closed"}};
+            else response={{"allocation_id",allocation},{"connect_before",QDateTime::currentDateTimeUtc().addSecs(30).toString(Qt::ISODateWithMs)},
+                           {"config_revision",14},{"config",config()}};
+            QTimer::singleShot(5,this,[promise,response]{ if (promise->future().isFinished()) return;
+                promise->addResult({ErrorCode::NoError,QJsonDocument(response).toJson(QJsonDocument::Compact),true}); promise->finish(); });
+            return future;
+        }
         if(path.endsWith("config") && failConfigCount>0) {
             --failConfigCount; events<<"config_fail";
             auto promise=std::make_shared<QPromise<GatewayPostResult>>(); promise->start(); auto future=promise->future();
@@ -504,13 +545,16 @@ struct World : QObject {
                 {"port",49963},{"preferred",candidate==first},{"expected_egress_ips",QJsonArray{"81.29.149.103"}}});
             }
             response={{"mayak_connection",QJsonObject{{"schema",1},{"revision",14},{"expires_at",QDateTime::currentDateTimeUtc().addSecs(60).toString(Qt::ISODateWithMs)},{"candidates",candidates}}}};
+            delay=configDelay;
+            if (!configError.isEmpty()) response=configError;
         } else {
             const auto action=payload.value("action").toString();events<<action;
             if(action=="acquire") {
                 publicKey=payload.value("public_key").toString();
                 selectedHost=payload.value("candidate_id").toString()==first?"81.29.149.103":"81.29.149.104";
                 ++acquires; delay=acquireDelay;
-                if(fullFirst && acquires==1) response={{"http_status",409},{"code","FULL"},{"message","full"}};
+                if (invalidNextAcquire) { invalidNextAcquire=false; response={{"http_status",400},{"code","INVALID_REQUEST"},{"message","open place"}}; }
+                else if(fullFirst && acquires==1) response={{"http_status",409},{"code","FULL"},{"message","full"}};
                 else { response={{"allocation_id",allocation},{"connect_before",QDateTime::currentDateTimeUtc().addSecs(30).toString(Qt::ISODateWithMs)},
                     {"config_revision",14},{"config",config()}}; trusted=!lostAcquire; }
                 if (!response.contains("http_status") && offerXray && payload.value("mayak_paths").toInt()==1)
@@ -538,7 +582,14 @@ struct World : QObject {
                 response=errorProven ? QJsonObject{{"http_status",403},{"code","REVOKED"},{"message","REVOKED"}}
                                      : QJsonObject{{"proven",!refuseProven}};
             }
-            else if(action=="reconcile") {++reconciles;delay=reconcileDelay;response={{"reconciled",!backendRunning}};}
+            else if(action=="reconcile") {
+                ++reconciles;delay=reconcileDelay;
+                // Like the server: a deferred older attempt is reconciled while another tunnel runs.
+                bool deferred=false;
+                for (const auto& e:QJsonDocument::fromJson(settings.value("Mayak/deferredCleanup").toByteArray()).array())
+                    if (e.toObject().value("attempt").toString()==payload.value("attempt_id").toString()) deferred=true;
+                response={{"reconciled",(!backendRunning || deferred) && !refuseReconcile}};
+            }
         }
         auto promise=std::make_shared<QPromise<GatewayPostResult>>();promise->start();auto future=promise->future();
         allTransportPromises.append(promise);
@@ -619,6 +670,17 @@ struct CoordinatorTimingGuard {
 // Restores the default (service) app-exclusion preparation.
 struct SplitPrepareGuard { ~SplitPrepareGuard() { MayakAutoConnectRuntime::setSplitPrepareForTests({}); } };
 struct HttpsResetGuard { ~HttpsResetGuard() { MayakAutoConnectRuntime::setHttpsSocketResetForTests({}); } };
+// Connect without the gateway: short late-acquire/proven timing; restored after the test.
+struct OfflineTiming {
+    MayakAutoConnectRuntime::RecoveryTiming previous=MayakAutoConnectRuntime::recoveryTiming();
+    explicit OfflineTiming(qint64 earlyMs=3500) {
+        auto t=MayakAutoConnectRuntime::recoveryTiming();
+        t.offlineEarlyMs=earlyMs; t.lateAcquireBudgetMs=500; t.lateAcquireRetryMs={100,150};
+        t.provenRetryBudgetMs=500; t.provenRetryMs={100,150};
+        MayakAutoConnectRuntime::setRecoveryTimingForTests(t);
+    }
+    ~OfflineTiming() { MayakAutoConnectRuntime::setRecoveryTimingForTests(previous); }
+};
 class RuntimeTest : public QObject {
     Q_OBJECT
 private slots:
@@ -1368,7 +1430,7 @@ private slots:
         QVERIFY(phases.contains(QStringLiteral("cancelled")));
     }
     void neverFinishingReleaseSettlesAndManualRetryReconciles() {
-        World w; w.holdReleaseForever=true;
+        World w; w.holdReleaseForever=true; w.noOfflineMemory=true;
         w.runtime->begin(w.id);
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,4000);
         const int starts=w.starts, acquires=w.acquires;
@@ -1587,7 +1649,7 @@ private slots:
         QCOMPARE(w.acquires,0); QCOMPARE(w.starts,0);
     }
     void lateReleasePositiveAfterBothDeadlinesCompletesConsistently() {
-        World w; w.releaseDelay=3500;
+        World w; w.releaseDelay=3500; w.noOfflineMemory=true;
         w.runtime->begin(w.id); QTRY_COMPARE(w.state,Vpn::ConnectionState::Connected);
         w.runtime->cancel(); QTRY_VERIFY_WITH_TIMEOUT(w.runtime->cleanupPending(),3000);
         QCOMPARE(w.runtime->connectionPhase(),QStringLiteral("failed"));
@@ -1596,7 +1658,7 @@ private slots:
         QCOMPARE(w.runtime->connectionPhase(),QStringLiteral("cancelled")); QVERIFY(!w.runtime->busy());
     }
     void neverStartedLateLeaseReconcileCanCompleteOffAndNewOn() {
-        World w; w.acquireDelay=300; w.holdReleaseForever=true;
+        World w; w.acquireDelay=300; w.holdReleaseForever=true; w.noOfflineMemory=true;
         w.runtime->begin(w.id); QTRY_COMPARE(w.acquires,1); w.runtime->cancel();
         QTRY_VERIFY_WITH_TIMEOUT(w.runtime->cleanupPending(),3500); QCOMPARE(w.starts,0); QCOMPARE(w.records(),1);
         w.holdReleaseForever=false; w.runtime->retryCleanup();
@@ -1662,7 +1724,7 @@ private slots:
         QCOMPARE(w.stops,10); QCOMPARE(w.reconciles,3);
     }
     void neverFinishingReconcileSettlesAndManualRetryCompletes() {
-        World w; w.failRelease=true;
+        World w; w.failRelease=true; w.noOfflineMemory=true;
         w.runtime->begin(w.id);
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,4000);
         w.runtime->cancel();
@@ -1820,7 +1882,7 @@ private slots:
         QCOMPARE(w.records(),0); QCOMPARE(w.state,Vpn::ConnectionState::Disconnected);
     }
     void retryWaitsForOriginalReleaseAndOldNegativeCannotReopenCleanup() {
-        World w; w.failRelease=true; w.releaseDelay=5000;
+        World w; w.failRelease=true; w.releaseDelay=5000; w.noOfflineMemory=true;
         w.runtime->begin(w.id);
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,4000);
         w.runtime->cancel();
@@ -2115,6 +2177,291 @@ private slots:
         QCOMPARE(w.records(),0);
     }
 
+    // ---- Connect without the gateway (review 01, item 2; 23.11.2026) ----
+    // One normal session: it stores the offered exits and the admitted exit's config, then ends.
+    static void connectOnceAndStop(World& w) {
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
+        QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+    }
+    // ---- Every exit gets its own selection budget (5.1.0.28, review 02 item 2) ----
+    void nextExitIsTriedAfterTheFirstUsedTheWholeBudget() {
+        FastRecoveryTiming timing; CoordinatorTimingGuard guard;
+        auto& t=mayak::autoconnect::Coordinator::timing();
+        t.cycleMs=1500; t.cycleWithXrayMs=1500; t.startMs=1000; t.awgVerifyMs=2500; // one exit can use it all
+        World w; w.silentFirst=true; // the first exit never answers a handshake
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.events.count("config"),1); // in the same cycle, not after a connect retry
+        QCOMPARE(w.acquireCandidate(0),w.first);
+        QCOMPARE(w.lastAcquireCandidate(),w.second);
+        settle(w);
+    }
+    // ---- Proven again when the app comes back (Android froze the UI process; review 02 item 5) ----
+    void provenIsSentAgainWhenTheAppComesBack() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        w.failProvenCount=100; // no answer to any "proven" (frozen / slow network)
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(w.provenCalls,3,5000); // first try + 2 retries, then given up
+        QTest::qWait(400);
+        QCOMPARE(w.provenCalls,3);
+        QVERIFY(w.observeVisibility);
+        w.failProvenCount=0;
+        w.observeVisibility(false); w.observeVisibility(true);
+        QTRY_COMPARE_WITH_TIMEOUT(w.provenCalls,4,3000);
+        w.observeVisibility(false); w.observeVisibility(true); // delivered now: not again
+        QTest::qWait(300);
+        QCOMPARE(w.provenCalls,4);
+        settle(w);
+    }
+    // ---- Always-on MayakNet journal (5.1.0.28, review 02 item 4) ----
+    void mayakNetJournalKeepsOnlyEventsAndRotates() {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        const QString path=dir.filePath("MayakNet-events.log");
+        Logger::setMayakNetJournalPathForTests(path);
+        Logger::enableMayakNetJournal();
+        qInfo().noquote() << "MayakNet event=journal_test value=1";
+        qInfo().noquote() << "Unrelated message https://example.org";
+        QFile file(path); QVERIFY(file.open(QIODevice::ReadOnly));
+        const QByteArray first=file.readAll(); file.close();
+        QVERIFY(first.contains("MayakNet event=journal_test value=1"));
+        QVERIFY(!first.contains("Unrelated message"));
+        // Rotation: never more than ~1 MB in the current file, the previous one kept as ".1".
+        const QString filler(120,QLatin1Char('x'));
+        for (int i=0;i<10000;++i) qInfo().noquote() << "MayakNet event=fill" << filler;
+        Logger::disableMayakNetJournalForTests();
+        Logger::setMayakNetJournalPathForTests({});
+        QVERIFY(QFile::exists(path+".1"));
+        QVERIFY(QFileInfo(path).size()<=1024*1024+4096);
+        QVERIFY(QFileInfo(path+".1").size()<=1024*1024+4096);
+        const qint64 before=QFileInfo(path).size();
+        qInfo().noquote() << "MayakNet event=after_disable";
+        QCOMPARE(QFileInfo(path).size(),before);
+    }
+    void offlineMemoryStoresOfferedExitsAndAdmittedConfig() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        QVERIFY(w.offlineMemory().isEmpty());
+        connectOnceAndStop(w);
+        const auto memory=w.offlineMemory();
+        QVERIFY(!memory.value("owner").toString().isEmpty());
+        const qint64 until=qint64(memory.value("until").toDouble());
+        const qint64 week=7LL*24*60*60*1000, nowMs=QDateTime::currentMSecsSinceEpoch();
+        QVERIFY(until>nowMs+week-60000 && until<=nowMs+week+1000); // no offline_until: the client's 7 days
+        const auto exits=memory.value("exits").toArray();
+        QCOMPARE(exits.size(),2);
+        int withConfig=0;
+        for (const auto& e:exits) if (!e.toObject().value("config").toString().isEmpty()) ++withConfig;
+        QCOMPARE(withConfig,1); // only the admitted exit has a config
+        QCOMPARE(exits.at(0).toObject().value("id").toString(),w.first);
+    }
+    void offlineStartsFromStoredExitAndReportsPlaceLater() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        connectOnceAndStop(w);
+        const int acquiresBefore=w.acquires, startsBefore=w.starts;
+        QStringList texts;
+        connect(w.runtime.get(),&MayakAutoConnectRuntime::stateChanged,&w,[&](Vpn::ConnectionState,QString t){texts<<t;});
+        w.gatewayDown=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QVERIFY(texts.contains(QStringLiteral("Подключаемся без сервера Маяка…")));
+        QCOMPARE(w.acquires,acquiresBefore); // no acquire before the start
+        QCOMPARE(w.starts,startsBefore+1);
+        QCOMPARE(w.records(),1);
+        // The gateway is back: the late acquire records the place, then proven names it.
+        const int provenBefore=w.provenCalls;
+        w.gatewayDown=false;
+        QTRY_VERIFY_WITH_TIMEOUT(w.lateAcquires>=1,5000);
+        QTRY_VERIFY_WITH_TIMEOUT(w.provenCalls>provenBefore,5000);
+        QCOMPARE(w.state,Vpn::ConnectionState::Connected);
+        const auto lateRequest=std::find_if(w.requestPayloads.begin(),w.requestPayloads.end(),[](const QJsonObject& p) {
+            return p.value("action").toString()=="acquire" && p.contains("late"); });
+        QVERIFY(lateRequest!=w.requestPayloads.end());
+        QVERIFY(lateRequest->value("late").isBool() && lateRequest->value("late").toBool());
+        settle(w);
+        QCOMPARE(w.releases,2); // the normal session's and the late place
+    }
+    void offlineStartsEarlyWhenGatewayIsSlowAndLateAnswerStartsNothing() {
+        FastRecoveryTiming timing; OfflineTiming offline(200); World w;
+        connectOnceAndStop(w);
+        const int acquiresBefore=w.acquires, startsBefore=w.starts;
+        w.configDelay=1500; w.lateMode=1; // the gateway answers v1/config late; the late acquire gets no answer
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,1400); // before the config answer
+        QTest::qWait(1600); // the signed config answer arrives during the stored-exit session
+        QCOMPARE(w.state,Vpn::ConnectionState::Connected);
+        QCOMPARE(w.starts,startsBefore+1);   // no second path
+        QCOMPARE(w.acquires,acquiresBefore); // no normal acquire
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
+        // The late acquire went out without an answer: its possible place waits in the deferred cleanup.
+        QCOMPARE(w.records(),0);
+        QCOMPARE(w.deferredCleanups(),1);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        // Next connect with the gateway up: the deferred cleanup is reconciled before a new place.
+        w.configDelay=0; w.lateMode=0;
+        const int reconcilesBefore=w.reconciles;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.reconciles,reconcilesBefore+1);
+        QCOMPARE(w.deferredCleanups(),0);
+        settle(w);
+    }
+    void offlineLateRevokedEndsSessionAndWipesMemory() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        connectOnceAndStop(w);
+        w.gatewayDown=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        w.lateMode=2; w.gatewayDown=false;
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,5000);
+        QCOMPARE(w.runtime->message(),QStringLiteral("Доступ отозван. Войдите в личный кабинет."));
+        QVERIFY(w.offlineMemory().isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
+        QCOMPARE(w.deferredCleanups(),0);
+        QVERIFY(!w.backendRunning);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+    }
+    void offlineLateNotReadyReconnectsTheNormalWay() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        connectOnceAndStop(w);
+        w.gatewayDown=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        const int acquiresBefore=w.acquires;
+        w.lateMode=3; w.gatewayDown=false;
+        QTRY_VERIFY_WITH_TIMEOUT(w.acquires>acquiresBefore && w.state==Vpn::ConnectionState::Connected &&
+                                 w.lastAcquireCandidate()==w.second,10000); // a normal place, another exit first
+        QVERIFY(!w.offlineMemory().isEmpty());
+        settle(w);
+    }
+    void offlineReleaseWithoutGatewayIsDeferredNotAnError() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        QList<Vpn::ConnectionState> seen;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        connect(w.runtime.get(),&MayakAutoConnectRuntime::stateChanged,&w,[&](Vpn::ConnectionState s,QString){seen<<s;});
+        w.gatewayDown=true; // the gateway goes down during a normal session
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,8000);
+        QVERIFY(!seen.contains(Vpn::ConnectionState::Error));
+        QCOMPARE(w.records(),0);
+        QCOMPARE(w.deferredCleanups(),1);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        // Still down: the next connect uses the stored exit (the deferred cleanup does not block it).
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        // Back: the late acquire records the place; the old one is reconciled.
+        w.gatewayDown=false;
+        QTRY_COMPARE_WITH_TIMEOUT(w.deferredCleanups(),0,5000);
+        settle(w);
+    }
+    void offlineUnansweredReleaseIsDeferredAndLatePositiveSettlesIt() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        w.holdReleaseForever=true; // the release reaches no answer within its 2.5 s
+        w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,6000);
+        QCOMPARE(w.records(),0); QCOMPARE(w.deferredCleanups(),1);
+        QVERIFY(!w.runtime->cleanupPending());
+        w.drainHeld(QByteArrayLiteral("{\"released\":true}")); // the server's late positive
+        QTRY_COMPARE_WITH_TIMEOUT(w.deferredCleanups(),0,3000);
+        QCOMPARE(w.state,Vpn::ConnectionState::Disconnected);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+    }
+    void offlineFailedStoredExitIsMovedBackNeverWiped() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        connectOnceAndStop(w);
+        w.gatewayDown=true; w.silentHost="81.29.149.103"; // the only stored exit with a config does not answer
+        w.runtime->begin(w.id);
+        QTRY_VERIFY_WITH_TIMEOUT(w.state==Vpn::ConnectionState::Error,30000);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        const auto exits=w.offlineMemory().value("exits").toArray();
+        QVERIFY(!exits.isEmpty());
+        int failures=0; bool config=false;
+        for (const auto& e:exits) if (e.toObject().value("id").toString()==w.first) {
+            failures=e.toObject().value("failures").toInt(); config=!e.toObject().value("config").toString().isEmpty(); }
+        QVERIFY(failures>=1); QVERIFY(config); // every failed cycle (with its connect retries) moves it back
+        QCOMPARE(w.records(),0);
+    }
+    void offlineNeverStartsOnSignedRefusal() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        connectOnceAndStop(w);
+        const int starts=w.starts;
+        // A signed 4xx without a code (older server): no stored exit, no wipe, the old error path.
+        w.configError={{"http_status",402},{"message","Access is not active"}};
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,10000);
+        QCOMPARE(w.starts,starts); QVERIFY(!w.offlineMemory().isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        // DISABLED: the reason, no retries, the memory stays (the switch-off may be temporary).
+        w.configError={{"http_status",402},{"code","DISABLED"},{"message","Device is disabled"}};
+        const int configs=w.events.count("config");
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,10000);
+        QCOMPARE(w.runtime->message(),QStringLiteral("Доступ этого устройства выключен или ещё не одобрен. Откройте личный кабинет."));
+        QCOMPARE(w.events.count("config"),configs+1);
+        QCOMPARE(w.starts,starts); QVERIFY(!w.offlineMemory().isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        // ACCOUNT_EXPIRED: the memory is wiped and the reason shown.
+        w.configError={{"http_status",402},{"code","ACCOUNT_EXPIRED"},{"message","Access is not active"}};
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,10000);
+        QCOMPARE(w.runtime->message(),QStringLiteral("Срок доступа закончился. Откройте личный кабинет."));
+        QVERIFY(w.offlineMemory().isEmpty()); QCOMPARE(w.starts,starts);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+    }
+    void offlineStartsOnSignedServerFailure() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        connectOnceAndStop(w);
+        w.configError={{"http_status",503},{"message","Service unavailable"}};
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(w.lateAcquires>=1,5000);
+        settle(w);
+    }
+    void invalidRequestOnFreshAcquireIsRepeatedAsLate() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        w.invalidNextAcquire=true; // an older place of this device is still open on the server
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.acquires,1); QCOMPARE(w.lateAcquires,1);
+        settle(w);
+    }
+    void refusedDeferredReconcileIsKeptAndCounted() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        w.gatewayDown=true; w.runtime->cancel();
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,8000);
+        QCOMPARE(w.deferredCleanups(),1);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+        // The gateway answers again but refuses the reconcile: the entry stays (counted), the
+        // connect goes on from the stored exits (the late acquire closes the older place).
+        w.gatewayDown=false; w.refuseReconcile=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QVERIFY(w.reconciles>=1);
+        QTRY_VERIFY_WITH_TIMEOUT(w.lateAcquires>=1,5000);
+        const auto entries=QJsonDocument::fromJson(w.settings.value("Mayak/deferredCleanup").toByteArray()).array();
+        QVERIFY(entries.isEmpty() || entries.first().toObject().value("refusals").toInt()>=1);
+        w.refuseReconcile=false;
+        settle(w);
+    }
+    void offlineNotUsedForRevokedOrWithoutMemory() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        // Without memory a gateway outage behaves as before (retries, then the error).
+        w.gatewayDown=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,10000);
+        QCOMPARE(w.starts,0);
+        QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+    }
+
     // ---- Windows: the local tunnel adapter does not come up (WinTun after an update) ----
     static void useWindowsHealthMeaning() {
         auto t=MayakAutoConnectRuntime::recoveryTiming(); t.noHealthMeansLocalFailure=true;
@@ -2359,7 +2706,7 @@ private slots:
         QVERIFY(!defaults.noHealthMeansLocalFailure);
 #endif
         // The first retry repairs WinTun first, so it comes sooner; the total budget stays.
-        QCOMPARE(defaults.localStartRetryMs,(QList<qint64>{10000,30000,60000,120000,240000,300000}));
+        QCOMPARE(defaults.localStartRetryMs,(QList<qint64>{10000,30000,60000})); // 5.1.0.28: shorter, then «перезагрузите компьютер»
     }
     void localAdapterRetryIsCancelledByUser() {
         FastRecoveryTiming timing; useWindowsHealthMeaning();
@@ -2612,7 +2959,7 @@ private slots:
     }
     // Bounded: a release that keeps failing ends with the usual cleanup hint after 3 tries.
     void releaseResendIsBounded() {
-        FastRecoveryTiming timing; World w(true);
+        FastRecoveryTiming timing; World w(true); w.noOfflineMemory=true;
         w.runtime->begin(w.id);
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
         w.failReleaseTransport=100;

@@ -29,6 +29,15 @@ public:
     static QString serviceLogsFilePath();
     static QString systemLogDir();
 
+    // Mayak (5.1.0.28): a small journal of the app's own "MayakNet " events only (no addresses, no
+    // sites), kept even when the full log is off, rotated at 1 MB (two files). The app enables it;
+    // the service never does. Installs the message handler so qInfo() events reach it.
+    static void enableMayakNetJournal();
+    static QString mayakNetJournalPath();
+    // Tests only: another journal file (empty = default); disabling restores the previous handler.
+    static void setMayakNetJournalPathForTests(const QString &path);
+    static void disableMayakNetJournalForTests();
+
     // compat with Mozilla logger
     Logger(const QString &className)
     {

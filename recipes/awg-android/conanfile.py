@@ -2,11 +2,12 @@ from conan import ConanFile
 from conan.tools.cmake import cmake_layout, CMake, CMakeToolchain
 from conan.tools.files import copy, replace_in_file
 from conan.tools.env import VirtualBuildEnv, Environment
-from conan.errors import ConanInvalidConfiguration
+from conan.errors import ConanInvalidConfiguration, ConanException
 from conan.tools.scm import Git
 
 import os
 import platform
+import shutil
 from pathlib import Path
 
 class AwgAndroid(ConanFile):
@@ -50,6 +51,39 @@ class AwgAndroid(ConanFile):
         # not to warn in case of strtok() usage
         tc.extra_cflags = ["-Wno-deprecated-declarations"]
         tc.generate()
+
+        if platform.system() == "Windows":
+            # The Makefile's own Go download (whose `.prepared` rule applies goruntime-boottime-over-
+            # monotonic.diff) is skipped on Windows (see _patch_sources). libwg-go is built with a copy
+            # of the tool_requires Go patched the same way (prepared in build()): Go timers must count
+            # time while the phone sleeps (CLOCK_BOOTTIME), or keepalives and rekeys stop in suspend.
+            goroot = self._boottime_goroot()
+            env = Environment()
+            env.define_path("GOROOT", goroot)
+            env.prepend_path("PATH", os.path.join(goroot, "bin"))
+            env.vars(self, scope="build").save_script("mayak_boottime_go")
+
+    def _boottime_goroot(self):
+        return os.path.join(self.build_folder, "go-boottime")
+
+    def _prepare_boottime_go(self):
+        source_go = self.dependencies.build["go"].package_folder
+        goroot = self._boottime_goroot()
+        if os.path.exists(goroot):
+            shutil.rmtree(goroot)
+        shutil.copytree(source_go, goroot)
+        # The same change as goruntime-boottime-over-monotonic.diff, for the only ABI built here (arm64):
+        # that diff targets the Go version pinned by the upstream Makefile and does not apply to every
+        # newer Go (e.g. its s390x hunk on Go 1.27). nanotime1 then reads CLOCK_BOOTTIME (7).
+        runtime_s = Path(goroot, "src", "runtime", "sys_linux_arm64.s")
+        text = runtime_s.read_text(encoding="utf-8")
+        if text.count("#define CLOCK_MONOTONIC 1") != 1 or text.count("$CLOCK_MONOTONIC, R0") < 1:
+            raise ConanException("Unexpected Go runtime source: sys_linux_arm64.s (boottime change)")
+        text = text.replace("#define CLOCK_MONOTONIC 1", "#define CLOCK_BOOTTIME 7")
+        text = text.replace("$CLOCK_MONOTONIC, R0", "$CLOCK_BOOTTIME, R0")
+        if "CLOCK_MONOTONIC" in text:
+            raise ConanException("Go runtime boottime change incomplete (sys_linux_arm64.s)")
+        runtime_s.write_text(text, encoding="utf-8", newline="\n")
 
     def _patch_sources(self):
         if platform.system() == 'Darwin':
@@ -101,6 +135,8 @@ class AwgAndroid(ConanFile):
 
     def build(self):
         self._patch_sources()
+        if platform.system() == "Windows":
+            self._prepare_boottime_go()
         cmake = CMake(self)
         cmake.configure(build_script_folder=os.path.join(self.source_folder, "tunnel", "tools"))
         cmake.build(target=["libwg-go.so", "libwg.so", "libwg-quick.so"])

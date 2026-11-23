@@ -32,6 +32,7 @@
 #include "secureQSettings.h"
 #include <map>
 #include <set>
+#include <tuple>
 #ifdef Q_OS_ANDROID
 #include <cstdlib>
 #include <dirent.h>
@@ -223,6 +224,130 @@ void rememberExit(SecureQSettings* settings, const QString& network, const QStri
     }
     settings->setValue(kExitMemoryKey, QJsonDocument(memory).toJson(QJsonDocument::Compact));
 }
+// Connect without the gateway (review 01, item 2; 23.11.2026). After every signed v1/config and
+// acquire the device keeps, encrypted (SecureQSettings, never sent, never logged), the exits it was
+// offered (at most 3) and, for each exit it was admitted to, the allocation config exactly as the
+// server sent it (its private key is a placeholder; the stable device key is substituted at start,
+// as for a fresh acquire), its Xray paths and the city card. When the gateway gives no signed
+// answer, a session connects to these exits directly and reports the place later (late acquire).
+// The device's peer is on every exit; the place is only accounting. Wiped only by authoritative
+// signals (REVOKED / ACCOUNT_EXPIRED) and ignored for another subscription/device key/credential or
+// after its bound; a stored exit that fails is moved back, never wiped (the gateway may be down
+// while the network is bad, exactly when the memory is needed).
+constexpr qint64 kOfflineDefaultMs = 7LL * 24 * 60 * 60 * 1000;
+const char* kOfflineMemoryKey = "Mayak/offlineMemory";
+struct OfflineExit {
+    QString id, host; quint16 port = 0; bool preferred = false; QStringList egress;
+    QString encodedConfig; QJsonArray xrayPaths; QString tunnelHash;
+    QString cityId; bool hasCard = false; ad::ExitLocationCard card;
+    int failures = 0; qint64 okAt = 0;
+    bool usable() const { return !id.isEmpty() && !host.isEmpty() && port != 0 && !egress.isEmpty() && !encodedConfig.isEmpty(); }
+};
+struct OfflineMemory {
+    QString owner; qint64 until = 0; QList<OfflineExit> exits;
+    bool usable(const QString& who, qint64 nowUtc) const {
+        if (owner.isEmpty() || owner != who || until <= nowUtc) return false;
+        return std::any_of(exits.begin(), exits.end(), [](const OfflineExit& e) { return e.usable(); });
+    }
+};
+// Binds the memory to this subscription, device key and device credential (hash only).
+QString offlineOwner(const QString& serverId, const QString& publicKey, const QString& apiKey) {
+    if (serverId.isEmpty() || publicKey.isEmpty() || apiKey.isEmpty()) return {};
+    return QString::fromLatin1(QCryptographicHash::hash((serverId + '|' + publicKey + '|' + apiKey).toUtf8(),
+                                                        QCryptographicHash::Sha256).toHex());
+}
+// The tunnel part of an allocation config: host and containers (exit key/PSK, port, AWG parameters,
+// client address, DNS), without the per-answer API fields (key expiry, end date, API key).
+QString offlineTunnelHash(const QString& encoded) {
+    QString body = encoded;
+    if (body.startsWith(QLatin1String("vpn://"))) body = body.mid(6);
+    const QByteArray raw = qUncompress(QByteArray::fromBase64(body.toLatin1(), QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
+    const QJsonObject root = QJsonDocument::fromJson(raw).object();
+    if (root.isEmpty()) return {};
+    const QByteArray part = QJsonDocument(QJsonObject{{"hostName", root.value("hostName")}, {"containers", root.value("containers")}})
+                                .toJson(QJsonDocument::Compact);
+    return QString::fromLatin1(QCryptographicHash::hash(part, QCryptographicHash::Sha256).toHex().left(16));
+}
+OfflineMemory loadOfflineMemory(SecureQSettings* settings) {
+    OfflineMemory m;
+    if (!settings) return m;
+    const QJsonObject root = QJsonDocument::fromJson(settings->value(kOfflineMemoryKey).toByteArray()).object();
+    m.owner = root.value("owner").toString(); m.until = qint64(root.value("until").toDouble());
+    for (const auto& value : root.value("exits").toArray()) {
+        const QJsonObject o = value.toObject(); OfflineExit e;
+        e.id = o.value("id").toString(); e.host = o.value("host").toString(); e.port = quint16(o.value("port").toInt());
+        e.preferred = o.value("preferred").toBool();
+        for (const auto& ip : o.value("egress").toArray()) e.egress << ip.toString();
+        e.encodedConfig = o.value("config").toString(); e.xrayPaths = o.value("xray").toArray(); e.tunnelHash = o.value("hash").toString();
+        e.cityId = o.value("cityId").toString();
+        const QJsonObject card = o.value("card").toObject();
+        e.hasCard = !card.isEmpty();
+        e.card = {card.value("city").toString(), card.value("country").toString(), card.value("countryCode").toString(),
+                  card.value("fact").toString(), card.value("photo").toString(), card.value("version").toString()};
+        e.failures = o.value("failures").toInt(); e.okAt = qint64(o.value("okAt").toDouble());
+        if (!e.id.isEmpty()) m.exits << e;
+    }
+    return m;
+}
+void saveOfflineMemory(SecureQSettings* settings, const OfflineMemory& m) {
+    if (!settings) return;
+    QJsonArray exits;
+    for (const auto& e : m.exits) {
+        QJsonObject o{{"id", e.id}, {"host", e.host}, {"port", int(e.port)}, {"preferred", e.preferred},
+                      {"egress", QJsonArray::fromStringList(e.egress)}, {"failures", e.failures}, {"okAt", double(e.okAt)}};
+        if (!e.encodedConfig.isEmpty()) { o.insert("config", e.encodedConfig); o.insert("hash", e.tunnelHash); }
+        if (!e.xrayPaths.isEmpty()) o.insert("xray", e.xrayPaths);
+        if (!e.cityId.isEmpty()) o.insert("cityId", e.cityId);
+        if (e.hasCard) o.insert("card", QJsonObject{{"city", e.card.city}, {"country", e.card.country}, {"countryCode", e.card.countryCode},
+                                                    {"fact", e.card.fact}, {"photo", e.card.photo}, {"version", e.card.version}});
+        exits.append(o);
+    }
+    settings->setValue(kOfflineMemoryKey, QJsonDocument(QJsonObject{{"owner", m.owner}, {"until", double(m.until)}, {"exits", exits}})
+                                              .toJson(QJsonDocument::Compact));
+}
+// Cleanup of a place whose release/reconcile got no answer at all while the gateway was down and the
+// tunnel is confirmed down: the exact attempt (with its original device authority) is kept here and
+// reconciled at the next signed gateway answer, so the gateway's outage neither blocks the OFF nor
+// the next connect. A late acquire also closes an older open place of the device on the server.
+const char* kDeferredCleanupKey = "Mayak/deferredCleanup";
+struct DeferredCleanup { at::AttemptIdentity identity; at::CleanupAuthorityInput authority; int refusals = 0; };
+// Never more entries than this; a full list refuses further deferral (the manual cleanup stays).
+constexpr int kDeferredCleanupMax = 32;
+// A reconcile the server refuses this often (e.g. another device key since) is given up.
+constexpr int kDeferredCleanupRefusals = 3;
+QList<DeferredCleanup> loadDeferredCleanup(SecureQSettings* settings) {
+    QList<DeferredCleanup> list;
+    if (!settings) return list;
+    for (const auto& value : QJsonDocument::fromJson(settings->value(kDeferredCleanupKey).toByteArray()).array()) {
+        const QJsonObject o = value.toObject(); DeferredCleanup d;
+        d.identity = {o.value("subscription").toString(), o.value("epoch").toString(), o.value("cycle").toString(),
+                      o.value("attempt").toString(), o.value("candidate").toString()};
+        d.authority = {o.value("gateway").toString(), o.value("installation").toString(), o.value("publicKey").toString(),
+                       o.value("apiKey").toString(), o.value("serviceType").toString(), o.value("serviceProtocol").toString(),
+                       o.value("userCountry").toString(), o.value("serverCountry").toString()};
+        d.refusals = o.value("refusals").toInt();
+        if (!d.identity.attemptId.isEmpty()) list << d;
+    }
+    return list;
+}
+void saveDeferredCleanup(SecureQSettings* settings, const QList<DeferredCleanup>& list) {
+    if (!settings) return;
+    if (list.isEmpty()) { settings->remove(kDeferredCleanupKey); return; }
+    QJsonArray array;
+    for (const auto& d : list)
+        array.append(QJsonObject{{"subscription", d.identity.localSubscriptionId}, {"epoch", d.identity.accountIdentityEpoch},
+            {"cycle", d.identity.cycleToken}, {"attempt", d.identity.attemptId}, {"candidate", d.identity.candidateId},
+            {"gateway", d.authority.gatewayEndpoint}, {"installation", d.authority.installationUuid}, {"publicKey", d.authority.publicKey},
+            {"apiKey", d.authority.deviceApiKey}, {"serviceType", d.authority.serviceType}, {"serviceProtocol", d.authority.serviceProtocol},
+            {"userCountry", d.authority.userCountryCode}, {"serverCountry", d.authority.serverCountryCode},
+            {"refusals", d.refusals}});
+    settings->setValue(kDeferredCleanupKey, QJsonDocument(array).toJson(QJsonDocument::Compact));
+}
+QJsonObject payloadForDeferred(const DeferredCleanup& d) {
+    return {{"auth_data", QJsonObject{{"api_key", d.authority.deviceApiKey}}}, {"installation_uuid", d.authority.installationUuid},
+        {"public_key", d.authority.publicKey}, {"service_type", d.authority.serviceType}, {"service_protocol", d.authority.serviceProtocol},
+        {"user_country_code", d.authority.userCountryCode}, {"server_country_code", d.authority.serverCountryCode}};
+}
 // Port precheck: one plain TCP connect per exit to its Xray port, all at once, before the exits
 // are tried. Nothing is sent (no TLS, no SNI). An exit that does not answer goes last, it is never
 // dropped (AWG over UDP may still work there). Its Xray paths on this port are skipped in this cycle.
@@ -352,6 +477,14 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
     // Exits offered in the current cycle and fresh acquires made in it (the AWG quick give-up
     // is used only while another exit or path is left to try).
     int cycleCandidates = 0, cycleAcquires = 0;
+    // Connect without the gateway (see OfflineMemory): the owner key of this session's memory, whether
+    // the current cycle's candidates came from the stored exits, and a final refusal of the late
+    // acquire (REVOKED / ACCOUNT_EXPIRED) that ends the session with that error.
+    QString offlineOwnerKey;
+    bool offlineCycle = false;
+    bool offlineRevoked = false;
+    ac::ErrorCategory lateTerminal = ac::ErrorCategory::None;
+    QString fetchRefusalText; // a signed v1/config refusal with its own message (no retries)
     // Windows: the service could not apply the user's app exclusions (split tunnel driver unavailable).
     // The cycle ends with a clear error instead of retrying or falling back to a path without exclusions.
     qint64 sessionStartMono = mayak::split::monotonicNowMs();
@@ -433,6 +566,18 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         qint64 startMono = 0, startUtc = 0, healthAt = 0;
         bool started = false, stopped = false, cancelled = false, probing = false;
         bool adopted = false; // continues the persisted attempt of an adopted running backend
+        // Started from the stored exits (no acquire before the start). Until the late acquire
+        // answers, the coordinator's allocation handle is `offlineHandle` (no place on the server).
+        bool offline = false;
+        QString offlineHandle;
+        bool lateSent = false;    // a late acquire went out: the server may hold a place for this attempt
+        bool lateSettled = false; // the late acquire got its final answer
+        bool lateNoPlace = false; // ... and the server holds no place for this attempt
+        bool offlineFailCounted = false;
+        bool releaseDeferred = false; // its release got no answer and was moved to the deferred cleanup
+        bool invalidRetried = false;  // a normal acquire refused with INVALID_REQUEST was repeated as late
+        bool provenDelivered = false; // the server answered this attempt's "proven"
+        bool provenInFlight = false;  // a "proven" post of this attempt is waiting for its answer
         bool releasePending = false, releaseCallbackHandled = false, releaseLateHandled = false;
         quint64 releaseOperationId = 0;
         bool reset = false;
@@ -778,8 +923,9 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             }
         }
         remembered=rememberedExit(settings,networkKey);
-        logNet(QStringLiteral("event=connection_method method=%1 xray_first=%2 remembered_exit=%3").arg(method)
-            .arg(rememberedXrayFirst(settings,networkKey) ? 1 : 0).arg(remembered.valid() ? 1 : 0));
+        offlineOwnerKey=offlineOwner(serverId,keys.wireGuardClientPubKey,authority.deviceApiKey);
+        logNet(QStringLiteral("event=connection_method method=%1 xray_first=%2 remembered_exit=%3 offline_memory=%4").arg(method)
+            .arg(rememberedXrayFirst(settings,networkKey) ? 1 : 0).arg(remembered.valid() ? 1 : 0).arg(offlineUsable() ? 1 : 0));
         preflightDeadline=now()+10000;
         inspectPreflight();
         timer.start();
@@ -823,6 +969,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             return true;
         }
         phase=QStringLiteral("cancelled"); output(Vpn::ConnectionState::Disconnected,{});
+        scheduleDeferredSweep();
         return true;
     }
     void inspectPreflight() {
@@ -968,6 +1115,12 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                         && cleanupOwner==self->cleanupGeneration && self->preparing && !self->terminal
                         && !self->cancelled && !self->cleanupPending && !self->cleanupOperation;
                 };
+                // The gateway gives no answer at all: with the stored exits the old place is reconciled
+                // later (deferred cleanup) and this connect goes on, possibly without the gateway.
+                if ((timedOut || !response.authenticatedResponse) && currentPreflight() &&
+                    self->deferCleanup(r.identity(),"preflight_no_answer")) {
+                    self->reconcileNext(); return;
+                }
                 if (timedOut) {
                     if (currentPreflight()) self->failure(QStringLiteral("Не удалось завершить прежний сеанс. Проверьте интернет и повторите попытку."));
                     return;
@@ -1018,9 +1171,11 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             output(Vpn::ConnectionState::Connecting,QStringLiteral("Подбираем способ подключения…")); break;
         case ac::State::Starting:
             logNet(QStringLiteral("event=path_start path=%1").arg(QString::fromStdString(s.pathId)));
-            output(Vpn::ConnectionState::Connecting,QStringLiteral("Проверяем VPN-соединение…")); break;
+            output(Vpn::ConnectionState::Connecting,offlineCycle ? QStringLiteral("Подключаемся без сервера Маяка…")
+                                                                 : QStringLiteral("Проверяем VPN-соединение…")); break;
         case ac::State::Verifying:
-            output(Vpn::ConnectionState::Connecting,QStringLiteral("Проверяем VPN-соединение…")); break;
+            output(Vpn::ConnectionState::Connecting,offlineCycle ? QStringLiteral("Подключаемся без сервера Маяка…")
+                                                                 : QStringLiteral("Проверяем VPN-соединение…")); break;
         case ac::State::Connected:
             lastMonitor=now(); {
                 QVariantMap location;
@@ -1042,6 +1197,8 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                     if (avoidedExitStorage().candidateId.compare(selected->identity.candidateId,Qt::CaseInsensitive)==0)
                         avoidedExitStorage()={{},0,avoidedExitStorage().knownExits};
                     selected->rxChangedAt=now();
+                    if (!selected->adopted) offlineMarkExit(selected->identity.candidateId,true);
+                    if (selected->offline) logNet(QStringLiteral("event=offline_connected"));
                     // Path memory (auto mode only): Xray proved here after AWG did not -> Xray first
                     // for a while on this network; AWG proved -> back to the default order.
                     if (method==QStringLiteral("auto") && !selected->adopted) {
@@ -1074,6 +1231,8 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                 if (settings) settings->remove(kWintunHealWantedKey);
                 connectedLocation=location;
                 output(Vpn::ConnectionState::Connected,QStringLiteral("Подключено"),location);
+                // The gateway revoked this device while the stored exit was starting: end it now.
+                if (lateTerminal!=ac::ErrorCategory::None) endOfflineSession(lateTerminal);
             } break;
         case ac::State::Stopping:
             // A path of the remembered exit did not come up (not the user's cancel): forget it (a later
@@ -1082,6 +1241,14 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                 s.error!=ac::ErrorCategory::None && s.error!=ac::ErrorCategory::Cancelled && !cancelled &&
                 !adoptRefused && remembered.is(QString::fromStdString(s.candidateId)))
                 forgetRemembered("path_failed");
+            // A stored exit that did not come up goes back in the memory (never wiped by failures).
+            if ((previousState==ac::State::Starting || previousState==ac::State::Verifying) &&
+                s.error!=ac::ErrorCategory::None && s.error!=ac::ErrorCategory::Cancelled && !cancelled) {
+                const auto failed=get(s.cycle,s.attempt);
+                if (failed && failed->offline && !failed->offlineFailCounted) {
+                    failed->offlineFailCounted=true; offlineMarkExit(failed->identity.candidateId,false);
+                }
+            }
             adoptRefused=false;
             if (s.switchingPath) {
                 logNet(QStringLiteral("event=path_failed path=%1 error=%2").arg(QString::fromStdString(s.pathId)).arg(int(s.error)));
@@ -1090,7 +1257,16 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             break;
         case ac::State::Failed:
             terminal=true;
-            if (appExclusionBlocked && !cancelled) {
+            if (lateTerminal!=ac::ErrorCategory::None && !cancelled && s.error!=ac::ErrorCategory::StopUnconfirmed) {
+                // The gateway revoked this device during a session from the stored exits.
+                const auto e=lateTerminal; lateTerminal=ac::ErrorCategory::None;
+                reconnectWanted=false; connectRetryAt=0;
+                output(Vpn::ConnectionState::Error,errorText(e));
+            } else if (!fetchRefusalText.isEmpty() && !cancelled && s.error!=ac::ErrorCategory::StopUnconfirmed) {
+                const QString text=fetchRefusalText; fetchRefusalText.clear();
+                reconnectWanted=false; connectRetryAt=0;
+                output(Vpn::ConnectionState::Error,text);
+            } else if (appExclusionBlocked && !cancelled) {
                 // Stop of the failed attempt was not confirmed: keep the exact cleanup and its retry hint.
                 if (s.error==ac::ErrorCategory::StopUnconfirmed) { cleanupPending=true; output(Vpn::ConnectionState::Error,cleanupText()); }
                 else output(Vpn::ConnectionState::Error,QString::fromUtf8(kAppExclusionUnavailable));
@@ -1301,6 +1477,11 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             // Another authenticated operation may already have durably settled
             // this exact record. A later negative/timeout cannot reopen it.
             if (self->finishCleanup()) return;
+            // No gateway answer at all, the tunnel confirmed down (checked before this reconcile):
+            // with the stored exits the OFF completes and the place is reconciled later.
+            if (first && (timedOut || !response.authenticatedResponse) && self->deferCleanup(record.identity(),"cleanup_no_answer")) {
+                self->cleanupPending=true; self->retryCleanup(true); return;
+            }
             if (timedOut) {
                 self->cleanupPending=true;
                 self->phase=QStringLiteral("failed"); self->output(Vpn::ConnectionState::Error,self->cleanupText());
@@ -1339,23 +1520,96 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
     void fetch(ac::CycleId c,ac::AttemptId a,ac::Millis deadline,int retry,FetchDone done) {
         auto self=shared_from_this();
         if(!identityCurrent() || now()>=deadline) { done(c,a,ac::FetchStatus::AuthRevoked,{}); return; }
+        if (retry==0) offlineCycle=false;
         const int timeout=int(qMax<qint64>(1,deadline-now()));
+        // One owner for this cycle's candidates: the gateway's signed answer or the stored exits,
+        // never both. `owned` is taken by whichever decides first; a later gateway answer then only
+        // refreshes the memory or ends a session the server revoked (no second path is started).
+        auto owned=std::make_shared<bool>(false);
+        auto offlineOwned=std::make_shared<bool>(false);
+        std::weak_ptr<Session> weakSelf=self;
+        const auto deliverOffline=[weakSelf,owned,offlineOwned,c,a,done](const char* reason) -> bool {
+            auto self=weakSelf.lock();
+            if (!self || *owned || self->cancelled || self->adoption.pending || !self->offlineUsable()) return false;
+            *owned=true; *offlineOwned=true; self->offlineCycle=true;
+            auto s=self->offlineSnapshot();
+            self->logNet(QStringLiteral("event=offline_start reason=%1 exits=%2").arg(QLatin1String(reason)).arg(s.candidates.size()));
+            done(c,a,ac::FetchStatus::Success,std::move(s));
+            return true;
+        };
+        if (retry==0 && !adoption.pending && offlineUsable())
+            QTimer::singleShot(qMax<qint64>(1,recoveryTimingStorage().offlineEarlyMs),this,[deliverOffline] { deliverOffline("slow"); });
         auto* watcher=new QFutureWatcher<GatewayPostResult>();
         ++inFlight;
-        connect(watcher,&QFutureWatcher<GatewayPostResult>::finished,watcher,[self,watcher,c,a,deadline,retry,done]() mutable {
+        connect(watcher,&QFutureWatcher<GatewayPostResult>::finished,watcher,[self,watcher,c,a,deadline,retry,done,owned,offlineOwned,deliverOffline]() mutable {
             const auto r=watcher->result(); watcher->deleteLater(); --self->inFlight;
             ad::AdmissionError err;
-            if(ad::parseAdmissionError(r.body,r.authenticatedResponse,&err)) {
+            const bool isError=ad::parseAdmissionError(r.body,r.authenticatedResponse,&err);
+            ad::ConnectionCapability cap;
+            const bool capOk=!isError && r.authenticatedResponse && ad::parseConnectionCapability(r.body,QDateTime::currentDateTimeUtc(),&cap);
+            if (isError && (err.code=="REVOKED" || err.code=="ACCOUNT_EXPIRED")) self->offlineWipe(err.code=="REVOKED" ? "revoked" : "expired");
+            if (capOk) self->offlineRememberCapability(cap);
+            if (*offlineOwned) {
+                // The stored exits own this cycle: a revoked/expired answer ends that session.
+                if (isError && (err.code=="REVOKED" || err.code=="ACCOUNT_EXPIRED"))
+                    self->endOfflineSession(err.code=="REVOKED" ? ac::ErrorCategory::AuthRevoked : ac::ErrorCategory::AccountExpired);
+                self->logNet(QStringLiteral("event=offline_late_config answered=%1").arg(isError || capOk ? 1 : 0));
+                return;
+            }
+            if (*owned) return;
+            // The stored exits only without a signed answer, for a signed server failure (5xx) or "no
+            // ready exit". A signed refusal (4xx: access ended, device disabled or revoked, another
+            // installation, device limit...) never starts them, with or without a known code.
+            int httpStatus=0; QString code;
+            if (isError) { httpStatus=err.httpStatus; code=err.code; }
+            else if (r.authenticatedResponse && !capOk) {
+                const QJsonObject body=QJsonDocument::fromJson(r.body).object();
+                httpStatus=body.value("http_status").toInt(); code=body.value("code").toString();
+            }
+            const bool offlineAllowed=!r.authenticatedResponse || (!capOk && (httpStatus>=500 || code=="no_ready_exit"));
+            if(isError) {
                 if(err.code=="provisioning" && retry<2 && self->now()+1500<deadline && !self->cancelled) {
+                    *owned=true; // the server answered: this device is not ready yet (no stored exits)
                     const int delay=qBound(250,err.retryAfterMs,2000);
                     QTimer::singleShot(delay,self.get(),[self,c,a,deadline,retry,done] { self->fetch(c,a,deadline,retry+1,done); }); return;
                 }
+                if (offlineAllowed && deliverOffline("server_error")) return;
+                *owned=true;
+                // Disabled (not approved yet or switched off) may be temporary: the memory stays, the
+                // reason is shown, no automatic retries.
+                if (err.code=="DISABLED")
+                    self->fetchRefusalText=QStringLiteral("Доступ этого устройства выключен или ещё не одобрен. Откройте личный кабинет.");
                 done(c,a,err.code=="REVOKED"?ac::FetchStatus::AuthRevoked:err.code=="ACCOUNT_EXPIRED"?ac::FetchStatus::AccountExpired:ac::FetchStatus::NetworkError,{}); return;
             }
-            ad::ConnectionCapability cap;
-            if(!r.authenticatedResponse || !ad::parseConnectionCapability(r.body,QDateTime::currentDateTimeUtc(),&cap)) {
+            if(!capOk) {
+                if (offlineAllowed && deliverOffline(r.authenticatedResponse ? "server_error" : "no_answer")) return;
+                *owned=true;
                 done(c,a,ac::FetchStatus::NetworkError,{}); return;
             }
+            *owned=true;
+            // A cleanup left by an earlier gateway outage is settled first: the server refuses a new
+            // place while an older one of the device is open. Not settled -> the stored exits.
+            if (!loadDeferredCleanup(self->settings).isEmpty()) {
+                ++self->inFlight;
+                self->reconcileDeferred(deadline-1500,[self,c,a,deadline,done,cap,owned,offlineOwned](bool clear) mutable {
+                    --self->inFlight;
+                    if (!clear && !self->cancelled && !self->adoption.pending && self->offlineUsable()) {
+                        *offlineOwned=true; self->offlineCycle=true;
+                        auto s=self->offlineSnapshot();
+                        self->logNet(QStringLiteral("event=offline_start reason=deferred_cleanup exits=%1").arg(s.candidates.size()));
+                        done(c,a,ac::FetchStatus::Success,std::move(s)); return;
+                    }
+                    self->continueFetch(c,a,deadline,cap,done);
+                });
+                return;
+            }
+            self->continueFetch(c,a,deadline,cap,done);
+        });
+        watcher->setFuture(transport(QStringLiteral("%1v1/config"),ad::buildMayakConfigPayload(common),timeout));
+    }
+    // The signed v1/config answer of this cycle (the gateway owns its candidates).
+    void continueFetch(ac::CycleId c,ac::AttemptId a,ac::Millis deadline,const ad::ConnectionCapability& cap,FetchDone done) {
+            auto self=shared_from_this();
             ac::Snapshot s; s.schemaVersion=cap.schema; s.revision=QString::number(cap.revision).toStdString();
             s.expiresAt=self->now()+QDateTime::currentDateTimeUtc().msecsTo(cap.expiresAt);
             for(const auto& v:cap.candidates) {
@@ -1388,8 +1642,6 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             if (self->adoption.pending) { done(c,a,ac::FetchStatus::Success,std::move(s)); return; }
             self->precheckPorts(std::move(s),deadline,[c,a,done](ac::Snapshot checked) mutable {
                 done(c,a,ac::FetchStatus::Success,std::move(checked)); });
-        });
-        watcher->setFuture(transport(QStringLiteral("%1v1/config"),ad::buildMayakConfigPayload(common),timeout));
     }
     // Parallel TCP check of the exits' Xray port (see tcpPortPrecheck). Exits that answered keep the
     // order (server order with the exit memory first); the others follow. Nothing answered at all
@@ -1435,6 +1687,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             });
             return;
         }
+        if (offlineCycle) { acquireFromMemory(c,n,candidate,std::move(done)); return; }
         const auto loaded=store->load();
         // A lost earlier acquire may still own a slot. Never allocate over it.
         if(!identityCurrent() || !loaded.ok || !loaded.records.isEmpty()) { done(c,n,{ac::AdmissionStatus::Malformed,{}}); return; }
@@ -1447,8 +1700,24 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         request.candidateId=a->identity.candidateId; request.commonPayload=common; request.deadlineUtcMs=utcDeadline(deadline);
         request.requestPaths=method!=QStringLiteral("awg");
         ++inFlight;
-        ad::MayakAdmissionClient::postAsync(request,transport,[self,a,c,n,done](ad::Response r) mutable {
+        // Kept alive by the request in flight; the retry below reuses it (weak self-reference).
+        auto handler=std::make_shared<std::function<void(ad::Response)>>();
+        std::weak_ptr<std::function<void(ad::Response)>> weakHandler=handler;
+        *handler=[self,a,c,n,done,request,weakHandler](ad::Response r) mutable {
             --self->inFlight;
+            // INVALID_REQUEST to a fresh attempt: an older place of this device is still open on the
+            // server (its cleanup was lost or is still deferred). Once: ask again as a late acquire,
+            // which closes the older place (review of item 2).
+            if (r.authenticatedResponse && r.isError && r.error.code=="INVALID_REQUEST" && !a->invalidRetried) {
+                if (auto again=weakHandler.lock()) {
+                    a->invalidRetried=true;
+                    self->logNet(QStringLiteral("event=acquire_invalid_retry_late"));
+                    ad::Request late=request; late.late=true;
+                    ++self->inFlight;
+                    ad::MayakAdmissionClient::postAsync(late,self->transport,[again](ad::Response response) { (*again)(response); });
+                    return;
+                }
+            }
             if(r.authenticatedResponse && r.acquireValid && r.success) {
                 a->allocation=r.acquire.allocationId; a->encodedConfig=r.acquire.encodedConfig;
                 if (r.acquire.exitLocationCandidateId.compare(a->identity.candidateId, Qt::CaseInsensitive) == 0) {
@@ -1461,6 +1730,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                 const bool saved=self->store->attachAllocation(a->identity,a->allocation).ok;
                 ac::Allocation allocation{a->allocation.toStdString(), saved?a->encodedConfig.toStdString():std::string{}, {}, false};
                 self->planPaths(a,r.acquire,&allocation);
+                self->offlineRememberAllocation(a,r.acquire);
                 done(c,n,{ac::AdmissionStatus::Admitted,std::move(allocation)}); return;
             }
             ac::AdmissionStatus status=ac::AdmissionStatus::Malformed;
@@ -1470,11 +1740,46 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                 else if(r.error.code=="DISABLED") status=ac::AdmissionStatus::Disabled;
                 else if(r.error.code=="REVOKED") status=ac::AdmissionStatus::AuthRevoked;
                 else if(r.error.code=="ACCOUNT_EXPIRED") status=ac::AdmissionStatus::AccountExpired;
+                if (status==ac::AdmissionStatus::AuthRevoked || status==ac::AdmissionStatus::AccountExpired)
+                    self->offlineWipe(status==ac::AdmissionStatus::AuthRevoked ? "revoked" : "expired");
                 if(status!=ac::AdmissionStatus::Malformed && !self->store->removeAfterConfirmedCleanup(a->identity).ok) status=ac::AdmissionStatus::Malformed;
             }
             // Unknown/lost reply retains record and terminates; next user retry reconciles.
             done(c,n,{status,{}});
-        });
+        };
+        ad::MayakAdmissionClient::postAsync(request,transport,[handler](ad::Response response) { (*handler)(response); });
+    }
+    // A candidate of the stored exits (see OfflineMemory): no request; the place is reported by the
+    // late acquire after «Подключено». The coordinator's handle names no place on the server.
+    void acquireFromMemory(ac::CycleId c,ac::AttemptId n,const ac::Candidate& candidate,AdmissionDone done) {
+        const auto loaded=store->load();
+        if(!identityCurrent() || !loaded.ok || !loaded.records.isEmpty()) { done(c,n,{ac::AdmissionStatus::Malformed,{}}); return; }
+        const QString id=QString::fromStdString(candidate.id);
+        const auto memory=loadOfflineMemory(settings);
+        const auto it=std::find_if(memory.exits.begin(),memory.exits.end(),[&id](const OfflineExit& e) {
+            return e.id.compare(id,Qt::CaseInsensitive)==0 && e.usable(); });
+        if (memory.owner!=offlineOwnerKey || it==memory.exits.end() || it->host!=QString::fromStdString(candidate.publicIpv4)) {
+            done(c,n,{ac::AdmissionStatus::NetworkError,{}}); return;
+        }
+        auto a=std::make_shared<Attempt>(); a->candidate=candidate; a->offline=true;
+        a->identity={serverId,epoch,cycleToken,randomId(),id};
+        a->ticket={a->identity.attemptId,std::make_shared<B::StartGate>()};
+        a->offlineHandle=QStringLiteral("offline-")+a->identity.attemptId; a->allocation=a->offlineHandle;
+        a->encodedConfig=it->encodedConfig;
+        a->exitLocationCityId=it->cityId; a->exitLocationHasCard=it->hasCard; a->exitLocationCard=it->card;
+        if(!store->appendBeforeAcquire({a->identity,authority,false,false,{}}).ok) { done(c,n,{ac::AdmissionStatus::Malformed,{}}); return; }
+        attempts[{c,n}]=a; ++cycleAcquires;
+        a->connectBefore=now()+ac::Coordinator::timing().cycleWithXrayMs;
+        ad::AcquireResponse stored; stored.encodedConfig=it->encodedConfig;
+        for (const auto& value:it->xrayPaths) {
+            const QJsonObject p=value.toObject();
+            stored.xrayPaths.push_back({p.value("id").toString(),p.value("fingerprint").toString(),p.value("config").toString()});
+        }
+        stored.xrayPathsOffered=!stored.xrayPaths.isEmpty();
+        ac::Allocation allocation{a->allocation.toStdString(),a->encodedConfig.toStdString(),{},false};
+        planPaths(a,stored,&allocation);
+        logNet(QStringLiteral("event=offline_acquire failures=%1").arg(it->failures));
+        done(c,n,{ac::AdmissionStatus::Admitted,std::move(allocation)});
     }
     // Idempotent acquire of the adopted attempt: same attempt id and cycle token, so the server
     // re-validates account/device/exit and must return the SAME allocation (no new slot).
@@ -1502,6 +1807,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                     a->exitLocationCard = r.acquire.exitLocationCard;
                 }
                 a->connectBefore=self->now()+qMax<qint64>(15000,QDateTime::currentDateTimeUtc().msecsTo(r.acquire.connectBefore));
+                self->offlineRememberAllocation(a,r.acquire);
                 // The adopted backend is the AWG one that is already running.
                 done(c,n,{ac::AdmissionStatus::Admitted,{a->allocation.toStdString(),a->encodedConfig.toStdString(),
                     {{"awg",ac::PathKind::Awg}},true}}); return;
@@ -1838,8 +2144,43 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
     void releaseAllocation(ac::CycleId c,ac::AttemptId n,const std::string& exact,BasicDone done) override {
         auto a=get(c,n);
         if(!a) { qInfo() << "MayakRelease started=false reason=attempt_missing"; return; }
-        const bool allocationMatches=a->allocation==QString::fromStdString(exact);
         const bool cleanupConfirmed=!a->started || a->stopped;
+        // A session from the stored exits: the coordinator names the offline handle. Once the late
+        // acquire answered with a place, that place is released below like any other.
+        if (a->offline && QString::fromStdString(exact)==a->offlineHandle && a->allocation==a->offlineHandle) {
+            if (!cleanupConfirmed) { qInfo() << "MayakRelease started=false offline=true cleanup_confirmed=false"; return; }
+            resetHttpsSockets("tunnel_stopped");
+            bool removed=false;
+            if (!a->lateSent || a->lateNoPlace || offlineRevoked) {
+                // The server never saw this attempt or holds no place for it: nothing to release there.
+                removed=store->removeAfterConfirmedCleanup(a->identity).ok;
+                logNet(QStringLiteral("event=offline_release local=1 ok=%1").arg(removed ? 1 : 0));
+            } else {
+                // A late acquire went out without a final answer: the server may hold a place for this
+                // attempt. Reconcile it at the next gateway answer (it releases every place of the attempt).
+                removed=deferCleanup(a->identity,"offline_release");
+            }
+            std::weak_ptr<Session> weak=shared_from_this();
+            QTimer::singleShot(0,this,[weak,c,n,done,removed] {
+                auto self=weak.lock(); if (!self) return;
+                if (!removed) {
+                    self->cleanupPending=true; self->terminal=true;
+                    self->phase=QStringLiteral("failed"); self->output(Vpn::ConnectionState::Error,self->cleanupText());
+                    return;
+                }
+                const auto remaining=self->store->load();
+                if (!remaining.ok || !remaining.records.isEmpty()) {
+                    self->cleanupPending=true;
+                    if (self->cancelled) self->retryCleanup(true);
+                    return;
+                }
+                if (done) done(c,n);
+                if (self->cancelled) { self->cleanupPending=true; self->finishCleanup(); }
+            });
+            return;
+        }
+        const bool allocationMatches=a->allocation==QString::fromStdString(exact) ||
+            (a->offline && QString::fromStdString(exact)==a->offlineHandle && !a->allocation.isEmpty());
         if(!allocationMatches || !cleanupConfirmed) {
             qInfo() << "MayakRelease started=false allocation_match=" << allocationMatches
                     << "cleanup_confirmed=" << cleanupConfirmed;
@@ -1871,6 +2212,24 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         auto finish=[weak,a,c,n,done,settled,timedOutSeen,operation,weakResend,resends,releaseStarted](ad::Response r, bool timedOut) {
             auto self=weak.lock(); if (!self) return;
             if (a->releaseOperationId!=operation) return;
+            // Already moved to the deferred cleanup (no answer in time): a late positive settles it there.
+            if (a->releaseDeferred) {
+                if (!timedOut && r.success && r.authenticatedResponse) self->dropDeferred(a->identity.attemptId);
+                return;
+            }
+            // The tunnel is confirmed down and the gateway gave no answer at all: with the stored exits
+            // available, the OFF completes and the place is reconciled at the next gateway answer.
+            const auto completeDeferred=[&self,&a,c,n,&done](bool first) {
+                a->releaseDeferred=true;
+                const auto remaining=self->store->load();
+                if (!remaining.ok || !remaining.records.isEmpty()) {
+                    self->cleanupPending=true;
+                    if (self->cancelled) self->retryCleanup(true);
+                    return;
+                }
+                if (first && done) done(c,n);
+                if (self->cancelled || !first) { self->cleanupPending=true; self->finishCleanup(); }
+            };
             if (!timedOut && !*settled && !r.authenticatedResponse && r.transportError!=ErrorCode::NoError &&
                 *resends<2 && self->now()-releaseStarted<1500) {
                 if (auto again=weakResend.lock()) {
@@ -1887,6 +2246,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             if (timedOut) *timedOutSeen=true;
             else a->releaseLateHandled=true;
             if (first) { a->releaseCallbackHandled=true; a->releasePending=false; --self->inFlight; }
+            if (timedOut && first && self->deferCleanup(a->identity,"release_no_answer")) { completeDeferred(first); return; }
             if (timedOut) {
                 self->cleanupPending=true; self->terminal=true;
                 self->phase=QStringLiteral("failed");
@@ -1919,6 +2279,8 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                     self->phase=QStringLiteral("failed");
                     self->output(Vpn::ConnectionState::Error,QStringLiteral("Сервер подтвердил остановку; локальная запись очистки ожидает сохранения. Нажмите «Повторить отключение»."));
                 }
+            } else if (!r.authenticatedResponse && first && self->deferCleanup(a->identity,"release_no_answer")) {
+                completeDeferred(first);
             } else {
                 qInfo() << "MayakRelease ledger_remove attempted=false reason=release_not_accepted";
                 self->cleanupPending=true; self->terminal=true;
@@ -1936,6 +2298,16 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
     void reportProven(ac::CycleId c,ac::AttemptId n,const std::string&,BasicDone done) override {
         auto a=get(c,n); if(!a) return;
         auto self=shared_from_this();
+        if (a->offline && a->allocation==a->offlineHandle) {
+            // Started from the stored exits: there is no place to name yet. «Подключено» never waits
+            // for the gateway; the late acquire (then proven) runs in the background.
+            std::weak_ptr<Session> weak=self;
+            QTimer::singleShot(0,this,[weak,c,n,done] {
+                auto self=weak.lock(); if (self && done && !self->terminal && !self->cancelled) done(c,n);
+            });
+            sendLate(c,n,a,0);
+            return;
+        }
         const qint64 budget=recoveryTimingStorage().provenReportMs;
         ++inFlight;
         auto settled=std::make_shared<bool>(false);
@@ -1957,12 +2329,16 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         req.cycleToken=a->identity.cycleToken; req.allocationId=allocation; req.commonPayload=common;
         req.deadlineUtcMs=utcDeadline(now()+budget);
         std::weak_ptr<Session> weak=shared_from_this();
+        a->provenInFlight=true;
         ad::MayakAdmissionClient::postAsync(req,transport,[weak,a,c,n,tryIndex,delivered,allocation,first](ad::Response r) {
+            a->provenInFlight=false;
             if (first) first();
             auto self=weak.lock(); if (!self || *delivered) return;
             // Any authenticated server reply means the report arrived; only a missing reply is repeated.
             if (r.responseValid || r.isError || (r.authenticatedResponse && r.transportError==amnezia::ErrorCode::NoError)) {
-                *delivered=true;
+                *delivered=true; a->provenDelivered=true;
+                if (r.isError && (r.error.code=="REVOKED" || r.error.code=="ACCOUNT_EXPIRED"))
+                    self->offlineWipe(r.error.code=="REVOKED" ? "revoked" : "expired");
                 if (tryIndex>0 || !r.success)
                     self->logNet(QStringLiteral("event=proven_report result=%1 try=%2")
                         .arg(r.success ? QStringLiteral("ok") : QStringLiteral("refused")).arg(tryIndex+1));
@@ -1999,6 +2375,251 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         if (a->cancelled || a->stopped || a->releasePending || a->allocation!=allocation) return false;
         const auto& st=coordinator->status();
         return st.state==ac::State::Connected && st.cycle==c && st.attempt==n;
+    }
+    // ---------- Connect without the gateway (see OfflineMemory) ----------
+    static qint64 utcNowMs() { return QDateTime::currentMSecsSinceEpoch(); }
+    bool offlineUsable() const { return loadOfflineMemory(settings).usable(offlineOwnerKey,utcNowMs()); }
+    void offlineWipe(const char* reason) {
+        if (!settings || settings->storedValueClass(kOfflineMemoryKey)==SecureQSettings::StoredValueClass::Missing) return;
+        settings->remove(kOfflineMemoryKey);
+        logNet(QStringLiteral("event=offline_memory_wiped reason=%1").arg(QLatin1String(reason)));
+    }
+    // A signed v1/config: the offered exits (configs of the same exit and address are kept) and the bound.
+    void offlineRememberCapability(const ad::ConnectionCapability& cap) {
+        if (!settings || offlineOwnerKey.isEmpty()) return;
+        auto m=loadOfflineMemory(settings);
+        if (m.owner!=offlineOwnerKey) m=OfflineMemory{offlineOwnerKey,0,{}};
+        m.until=cap.offlineUntil.isValid() ? cap.offlineUntil.toMSecsSinceEpoch() : utcNowMs()+kOfflineDefaultMs;
+        QList<OfflineExit> next;
+        for (const auto& c:cap.candidates) {
+            OfflineExit e;
+            for (const auto& old:m.exits) if (old.id.compare(c.id,Qt::CaseInsensitive)==0) { e=old; break; }
+            if (!e.id.isEmpty() && e.host!=c.host) { e.encodedConfig.clear(); e.xrayPaths={}; e.tunnelHash.clear(); e.failures=0; }
+            e.id=c.id; e.host=c.host; e.port=c.port; e.preferred=c.preferred; e.egress=c.expectedEgressIps;
+            next<<e;
+        }
+        for (const auto& old:m.exits) {
+            if (next.size()>=3) break;
+            const bool listed=std::any_of(next.begin(),next.end(),[&old](const OfflineExit& e) { return e.id.compare(old.id,Qt::CaseInsensitive)==0; });
+            if (!listed && old.usable()) next<<old;
+        }
+        m.exits=next;
+        saveOfflineMemory(settings,m);
+    }
+    // A signed acquire (normal or late): this exit's config, Xray paths and card, as the server sent them.
+    void offlineRememberAllocation(const std::shared_ptr<Attempt>& a,const ad::AcquireResponse& r) {
+        if (!settings || offlineOwnerKey.isEmpty() || r.encodedConfig.isEmpty()) return;
+        auto m=loadOfflineMemory(settings);
+        if (m.owner!=offlineOwnerKey) m=OfflineMemory{offlineOwnerKey,0,{}};
+        const QString id=a->identity.candidateId;
+        int index=-1;
+        for (int i=0;i<m.exits.size();++i) if (m.exits.at(i).id.compare(id,Qt::CaseInsensitive)==0) { index=i; break; }
+        if (index<0) {
+            OfflineExit e; e.id=id; e.host=QString::fromStdString(a->candidate.publicIpv4); e.port=a->candidate.port;
+            e.preferred=a->candidate.preferred;
+            for (const auto& ip:a->candidate.expectedEgressIps) e.egress<<QString::fromStdString(ip);
+            m.exits.prepend(e); index=0;
+            while (m.exits.size()>3) m.exits.removeLast();
+        }
+        auto& e=m.exits[index];
+        const QString hash=offlineTunnelHash(r.encodedConfig);
+        if (!e.tunnelHash.isEmpty() && e.tunnelHash!=hash) logNet(QStringLiteral("event=offline_config_changed"));
+        e.encodedConfig=r.encodedConfig; e.tunnelHash=hash;
+        if (r.xrayPathsOffered || !r.xrayPaths.isEmpty()) {
+            QJsonArray xray;
+            for (const auto& p:r.xrayPaths) xray.append(QJsonObject{{"id",p.id},{"fingerprint",p.fingerprint},{"config",p.encodedConfig}});
+            e.xrayPaths=xray; // a request without paths (method "awg") keeps the stored ones
+        }
+        if (a->exitLocationHasCard || !a->exitLocationCityId.isEmpty()) {
+            e.cityId=a->exitLocationCityId; e.hasCard=a->exitLocationHasCard; e.card=a->exitLocationCard;
+        }
+        saveOfflineMemory(settings,m);
+    }
+    void offlineMarkExit(const QString& id,bool ok) {
+        if (!settings || offlineOwnerKey.isEmpty()) return;
+        auto m=loadOfflineMemory(settings);
+        if (m.owner!=offlineOwnerKey) return;
+        for (auto& e:m.exits) {
+            if (e.id.compare(id,Qt::CaseInsensitive)!=0) continue;
+            if (ok) { if (e.failures==0 && e.okAt>utcNowMs()-60000) return; e.failures=0; e.okAt=utcNowMs(); }
+            else ++e.failures;
+            saveOfflineMemory(settings,m); return;
+        }
+    }
+    // The stored exits as a candidate snapshot: this network's remembered exit first, then the
+    // fewest failures and the latest success; an exit that just stopped working goes last.
+    ac::Snapshot offlineSnapshot() {
+        const auto m=loadOfflineMemory(settings);
+        std::vector<OfflineExit> list;
+        for (const auto& e:m.exits) if (e.usable()) list.push_back(e);
+        const QString avoid=now()<avoidedExitStorage().until ? avoidedExitStorage().candidateId : QString();
+        const auto rank=[this,&avoid](const OfflineExit& e) {
+            return std::make_tuple(!avoid.isEmpty() && e.id.compare(avoid,Qt::CaseInsensitive)==0 ? 1 : 0,
+                                   remembered.is(e.id) ? 0 : 1, e.failures, -e.okAt);
+        };
+        std::stable_sort(list.begin(),list.end(),[&rank](const OfflineExit& x,const OfflineExit& y) { return rank(x)<rank(y); });
+        ac::Snapshot s; s.schemaVersion=1; s.revision="offline"; s.expiresAt=now()+120000;
+        for (const auto& e:list) {
+            if (s.candidates.size()>=3) break;
+            ac::Candidate c{e.id.toStdString(),e.host.toStdString(),e.port,e.preferred,{}};
+            for (const auto& ip:e.egress) c.expectedEgressIps.push_back(ip.toStdString());
+            s.candidates.push_back(std::move(c));
+        }
+        avoidedExitStorage().knownExits=int(s.candidates.size());
+        cycleAcquires=0; cycleCandidates=int(s.candidates.size());
+        return s;
+    }
+    // Moves the exact attempt record (with its original device authority) to the deferred cleanup
+    // (see DeferredCleanup). Only for a release/reconcile without any gateway answer, the tunnel
+    // confirmed down, and only while the stored exits can carry the next connect.
+    bool deferCleanup(const at::AttemptIdentity& identity,const char* reason) {
+        if (!store || !offlineUsable()) return false;
+        const auto loaded=store->load();
+        if (!loaded.ok) return false;
+        const auto it=std::find_if(loaded.records.begin(),loaded.records.end(),[&identity](const at::AttemptRecord& r) { return r.identity()==identity; });
+        if (it==loaded.records.end()) return false;
+        auto list=loadDeferredCleanup(settings);
+        if (!std::any_of(list.begin(),list.end(),[&identity](const DeferredCleanup& d) { return d.identity.attemptId==identity.attemptId; })) {
+            if (list.size()>=kDeferredCleanupMax) return false; // never drop an owed cleanup
+            list<<DeferredCleanup{it->identity(),{it->gatewayEndpoint(),it->installationUuid(),it->publicKey(),it->deviceApiKey(),
+                                                  it->serviceType(),it->serviceProtocol(),it->userCountryCode(),it->serverCountryCode()},0};
+            saveDeferredCleanup(settings,list);
+        }
+        if (!store->removeAfterConfirmedCleanup(identity).ok) return false;
+        logNet(QStringLiteral("event=cleanup_deferred reason=%1 pending=%2").arg(QLatin1String(reason)).arg(list.size()));
+        return true;
+    }
+    void dropDeferred(const QString& attemptId) {
+        auto list=loadDeferredCleanup(settings);
+        const auto before=list.size();
+        list.erase(std::remove_if(list.begin(),list.end(),[&attemptId](const DeferredCleanup& d) { return d.identity.attemptId==attemptId; }),list.end());
+        if (list.size()!=before) saveDeferredCleanup(settings,list);
+    }
+    // Reconciles the deferred cleanups one by one (each tried once per call); then(true) when none is
+    // left. An accepted reconcile settles an entry; a refused one counts against it (given up after
+    // kDeferredCleanupRefusals); no answer stops with then(false). countBusy=false for background
+    // sweeps (they never hold the session busy).
+    void reconcileDeferred(qint64 deadline,std::function<void(bool)> then,bool countBusy=true,int index=0) {
+        const auto list=loadDeferredCleanup(settings);
+        if (index>=list.size()) { if (then) then(list.isEmpty()); return; }
+        if (now()+500>=deadline) { if (then) then(false); return; }
+        const auto d=list.at(index);
+        ad::Request req; req.action="reconcile"; req.attemptId=d.identity.attemptId; req.cycleToken=d.identity.cycleToken;
+        req.commonPayload=payloadForDeferred(d);
+        const qint64 until=qMin(now()+2500,deadline); req.deadlineUtcMs=utcDeadline(until);
+        if (countBusy) ++inFlight;
+        auto settled=std::make_shared<bool>(false);
+        std::weak_ptr<Session> weak=shared_from_this();
+        auto settle=[weak,settled,d,deadline,then,countBusy,index](bool answered,bool ok) {
+            auto self=weak.lock(); if (!self || *settled) return;
+            *settled=true; if (countBusy) --self->inFlight;
+            if (!answered) { if (then) then(false); return; }
+            int next=index;
+            if (ok) self->dropDeferred(d.identity.attemptId);
+            else if (!self->countDeferredRefusal(d.identity.attemptId)) ++next; // kept: try the next entry
+            self->logNet(QStringLiteral("event=cleanup_deferred_done reconciled=%1").arg(ok ? 1 : 0));
+            self->reconcileDeferred(deadline,then,countBusy,next);
+        };
+        QTimer::singleShot(qMax<qint64>(1,until-now()),this,[settle] { settle(false,false); });
+        ad::MayakAdmissionClient::postAsync(req,transport,[settle](ad::Response r) { settle(r.authenticatedResponse,r.success && r.authenticatedResponse); });
+    }
+    // One more refusal of this entry; true when it was given up (removed).
+    bool countDeferredRefusal(const QString& attemptId) {
+        auto list=loadDeferredCleanup(settings);
+        for (int i=0;i<list.size();++i) {
+            if (list.at(i).identity.attemptId!=attemptId) continue;
+            if (++list[i].refusals>=kDeferredCleanupRefusals) {
+                list.removeAt(i); saveDeferredCleanup(settings,list);
+                logNet(QStringLiteral("event=cleanup_deferred_given_up"));
+                return true;
+            }
+            saveDeferredCleanup(settings,list); return false;
+        }
+        return true;
+    }
+    // After an OFF with cleanups still owed: reconcile them in the background (30 s, 2 min, 10 min)
+    // while this session is the app's current one, so a place left open does not hold capacity.
+    void scheduleDeferredSweep(int step=0) {
+        static const qint64 delays[]={30000,120000,600000};
+        if (step>=3 || loadDeferredCleanup(settings).isEmpty()) return;
+        std::weak_ptr<Session> weak=shared_from_this();
+        QTimer::singleShot(delays[step],this,[weak,step] {
+            auto self=weak.lock();
+            if (!self || !self->facade || self->facade->m_session.get()!=self.get() || loadDeferredCleanup(self->settings).isEmpty()) return;
+            self->reconcileDeferred(self->now()+15000,[weak,step](bool) { if (auto s=weak.lock()) s->scheduleDeferredSweep(step+1); },false);
+        });
+    }
+    // The late acquire matters only while the same attempt is connected.
+    bool lateStillWanted(ac::CycleId c,ac::AttemptId n,const std::shared_ptr<Attempt>& a) {
+        if (!a || cancelled || terminal || !coordinator || get(c,n)!=a || a->cancelled || a->stopped || a->releasePending) return false;
+        const auto& st=coordinator->status();
+        return st.state==ac::State::Connected && st.cycle==c && st.attempt==n;
+    }
+    // The gateway revoked this device (or its access ended) during a session from the stored exits:
+    // end it with that error (a start in progress ends at «Подключено», see state()).
+    void endOfflineSession(ac::ErrorCategory category) {
+        offlineRevoked=true; lateTerminal=category; reconnectWanted=false; connectRetryAt=0;
+        if (!coordinator || coordinator->status().state!=ac::State::Connected) return;
+        const auto cycle=coordinator->status().cycle;
+        std::weak_ptr<Session> weak=shared_from_this();
+        QTimer::singleShot(0,this,[weak,cycle] {
+            auto self=weak.lock(); if (self && self->coordinator) self->coordinator->onOwnRepairExhausted(cycle);
+        });
+    }
+    // Late acquire (late: true) of a session started from the stored exits, then proven. The server
+    // records the place even over capacity and closes an older open place of this device; a repeat
+    // with the same attempt returns the same place. No answer -> again later while connected.
+    void sendLate(ac::CycleId c,ac::AttemptId n,const std::shared_ptr<Attempt>& a,int tryIndex) {
+        if (!lateStillWanted(c,n,a) || a->lateSettled) return;
+        a->lateSent=true;
+        ad::Request req; req.action="acquire"; req.attemptId=a->identity.attemptId; req.cycleToken=a->identity.cycleToken;
+        req.candidateId=a->identity.candidateId; req.commonPayload=common; req.late=true; req.requestPaths=method!=QStringLiteral("awg");
+        req.deadlineUtcMs=utcDeadline(now()+recoveryTimingStorage().lateAcquireBudgetMs);
+        logNet(QStringLiteral("event=late_acquire try=%1").arg(tryIndex+1));
+        std::weak_ptr<Session> weak=shared_from_this();
+        ad::MayakAdmissionClient::postAsync(req,transport,[weak,a,c,n,tryIndex](ad::Response r) {
+            auto self=weak.lock(); if (!self || a->lateSettled) return;
+            if (r.authenticatedResponse && r.isError &&
+                (r.error.code=="REVOKED" || r.error.code=="ACCOUNT_EXPIRED")) {
+                a->lateSettled=true; a->lateNoPlace=true;
+                self->offlineWipe(r.error.code=="REVOKED" ? "revoked" : "expired");
+                self->logNet(QStringLiteral("event=late_acquire result=%1").arg(r.error.code.toLower()));
+                if (self->lateStillWanted(c,n,a))
+                    self->endOfflineSession(r.error.code=="REVOKED" ? ac::ErrorCategory::AuthRevoked : ac::ErrorCategory::AccountExpired);
+                return;
+            }
+            if (!self->lateStillWanted(c,n,a)) return; // released meanwhile: the deferred cleanup owns it
+            if (r.authenticatedResponse && r.acquireValid && r.success) {
+                a->lateSettled=true; a->allocation=r.acquire.allocationId;
+                self->store->attachAllocation(a->identity,a->allocation);
+                self->offlineRememberAllocation(a,r.acquire);
+                self->logNet(QStringLiteral("event=late_acquire result=ok try=%1").arg(tryIndex+1));
+                self->reconcileDeferred(self->now()+10000,{},false);
+                self->sendProven(c,n,a,recoveryTimingStorage().provenRetryBudgetMs,0,std::make_shared<bool>(false),a->allocation,{});
+                return;
+            }
+            if (r.authenticatedResponse && r.isError) {
+                // NOT_READY / DISABLED: this exit is no longer for this device; the gateway answers now,
+                // so reconnect the normal way. INVALID_REQUEST: the place is already closed (a later
+                // acquire of this device); FULL: an older server without "late". No place is held.
+                a->lateSettled=true; a->lateNoPlace=true;
+                const QString code=r.error.code;
+                self->logNet(QStringLiteral("event=late_acquire result=%1").arg(code.toLower()));
+                if (code=="NOT_READY" || code=="DISABLED") {
+                    self->reconnectWanted=true;
+                    self->avoidCandidate(a->identity.candidateId,"late_not_ready");
+                    self->coordinator->onOwnRepairExhausted(c);
+                }
+                return;
+            }
+            const auto& delays=recoveryTimingStorage().lateAcquireRetryMs;
+            const qint64 delay=delays.isEmpty() ? 300000 : delays.at(qMin<qsizetype>(tryIndex,delays.size()-1));
+            self->logNet(QStringLiteral("event=late_acquire result=no_answer try=%1 next_s=%2").arg(tryIndex+1).arg(delay/1000));
+            std::weak_ptr<Session> again=self;
+            QTimer::singleShot(delay,self.get(),[again,a,c,n,tryIndex] {
+                auto self=again.lock(); if (self) self->sendLate(c,n,a,tryIndex+1);
+            });
+        });
     }
     void cancelOwned(ac::CycleId c,ac::AttemptId n) override {
         if (race.tag==std::make_pair(c,n)) stopRace();
@@ -2158,7 +2779,18 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         logNet(QStringLiteral("event=ui_%1").arg(visible ? QStringLiteral("visible") : QStringLiteral("hidden")));
         if (!visible) return;
         // Back in front: health resumes now; give it one interval before judging its age.
-        if (auto a=connectedAttempt(); a && !a->cancelled) { a->healthAt=now(); lastMonitor=now(); }
+        if (auto a=connectedAttempt(); a && !a->cancelled) {
+            a->healthAt=now(); lastMonitor=now();
+            // Android freezes this (UI) process in the background; a "proven" that got no answer
+            // before that is sent again now (review 02, item 5). Late proven: the place keeps its
+            // first connect time on the server.
+            const auto s=coordinator->status();
+            if (!a->provenDelivered && !a->provenInFlight && (!a->offline || a->allocation!=a->offlineHandle) &&
+                provenStillWanted(s.cycle,s.attempt,a,a->allocation)) {
+                logNet(QStringLiteral("event=proven_report result=resend reason=ui_visible"));
+                sendProven(s.cycle,s.attempt,a,recoveryTimingStorage().provenRetryBudgetMs,0,std::make_shared<bool>(false),a->allocation,{});
+            }
+        }
     }
     void startRecover(const std::shared_ptr<Attempt>& a) {
         const auto& t=recoveryTimingStorage();

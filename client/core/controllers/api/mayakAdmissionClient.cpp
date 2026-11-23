@@ -179,6 +179,12 @@ bool parseConnectionCapability(const QByteArray &responseBody, const QDateTime &
         candidates.push_back(candidate);
     }
     out->schema = 1; out->revision = static_cast<qint64>(revision.toDouble()); out->expiresAt = expiresAt; out->candidates = candidates;
+    // Optional offline bound: a malformed or implausible value never rejects the capability above.
+    QString offline;
+    if (boundedString(obj.value(QStringLiteral("offline_until")), 40, &offline)) {
+        const QDateTime until = QDateTime::fromString(offline, Qt::ISODate).toUTC();
+        if (until.isValid() && until > nowUtc.toUTC() && until <= nowUtc.toUTC().addDays(31)) out->offlineUntil = until;
+    }
     return true;
 }
 
@@ -425,6 +431,7 @@ QJsonObject buildPayload(const Request &request, bool *valid)
     payload.remove(QStringLiteral("allocation_id"));
     payload.remove(QStringLiteral("mayak_exit_location"));
     payload.remove(QStringLiteral("mayak_paths"));
+    payload.remove(QStringLiteral("late"));
     payload.insert(QStringLiteral("action"), request.action);
     payload.insert(QStringLiteral("attempt_id"), request.attemptId);
     if (request.action == QStringLiteral("acquire")) {
@@ -432,6 +439,8 @@ QJsonObject buildPayload(const Request &request, bool *valid)
         // 2 = ids plus the admin city card (needs the server from 16.11.2026; an older one returns nothing).
         payload.insert(QStringLiteral("mayak_exit_location"), 2);
         if (request.requestPaths) payload.insert(QStringLiteral("mayak_paths"), 1);
+        // The server reads only a JSON boolean true here (not 1, not "true").
+        if (request.late) payload.insert(QStringLiteral("late"), true);
     }
     if (request.action == QStringLiteral("proven") || request.action == QStringLiteral("release"))
         payload.insert(QStringLiteral("allocation_id"), request.allocationId);

@@ -61,7 +61,9 @@ public:
         bool noHealthMeansLocalFailure = false;
 #endif
         // The first retry repairs WinTun in the service first (see healWintunFirst), so it comes sooner.
-        QList<qint64> localStartRetryMs { 10000, 30000, 60000, 120000, 240000, 300000 };
+        // 5.1.0.28: three short retries, then «перезагрузите компьютер» (a field device waited up to
+        // 5 min between 13 attempts on the same exit while its adapter could not come up).
+        QList<qint64> localStartRetryMs { 10000, 30000, 60000 };
         // The "proven" report after a passing tunnel probe. The first try keeps its short budget
         // (it never delays «Подключено»); a try that got no answer from the server (timeout,
         // network) is repeated in the background with these delays while the same attempt stays
@@ -81,6 +83,14 @@ public:
 #endif
         // Parallel TCP check of every exit's Xray port before the exits are tried (no data sent).
         qint64 portPrecheckMs = 1500;
+        // Connect without the gateway (review 01, item 2): the stored exits are used when v1/config
+        // has no signed answer at all, or none this long after the request (the request goes on;
+        // a later answer only refreshes the memory or ends a revoked session).
+        qint64 offlineEarlyMs = 4500; // review: a slow but live gateway at peak should mostly still answer
+        // The late acquire (+ proven) of a session started from the stored exits: first try right
+        // after «Подключено», then these delays while it stays connected (the last one repeats).
+        qint64 lateAcquireBudgetMs = 8000;
+        QList<qint64> lateAcquireRetryMs { 5000, 30000, 120000, 300000 };
     };
     static RecoveryTiming recoveryTiming();
     static void setRecoveryTimingForTests(const RecoveryTiming& timing);

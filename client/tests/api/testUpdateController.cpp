@@ -165,6 +165,30 @@ class UpdateControllerTest final : public QObject
 {
     Q_OBJECT
 private slots:
+    void staleDownloadedPackagesAreRemovedAtStart()
+    {
+        QTemporaryDir cache(QDir::currentPath() + QStringLiteral("/update-stale-XXXXXX"));
+        QVERIFY(cache.isValid());
+        const QStringList stale{QStringLiteral("mayak-update-5.1.0.43-0dee48fb-55c4-4acc-b2ef-5b79a59cbd94.exe"),
+                                QStringLiteral("mayak-update-5.1.0.28-ea320f3c-e110-4a17-8098-630435576cd2.apk")};
+        for (const QString &name : stale + QStringList{QStringLiteral("unrelated.txt")}) {
+            QFile file(cache.filePath(name));
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            file.write("x");
+        }
+        UpdateControllerDependencies dependencies;
+        dependencies.platform = QStringLiteral("windows-x64");
+        dependencies.installedVersion = QStringLiteral("5.1.0.27");
+        dependencies.installedVersionCode = 2225;
+        dependencies.cacheDirectory = cache.path();
+        dependencies.manifestUrl = QUrl(QStringLiteral("https://mayaklight.ru/updates/stable/windows-x64.json"));
+        dependencies.automaticChecksEnabled = false;
+        dependencies.checkOnConstruction = false;
+        UpdateController controller(nullptr, dependencies);
+        for (const QString &name : stale) QVERIFY2(!QFile::exists(cache.filePath(name)), qPrintable(name));
+        QVERIFY(QFile::exists(cache.filePath(QStringLiteral("unrelated.txt"))));
+    }
+
     void manualCheckOriginIsTaggedAndConcurrentChecksCannotStealIt()
     {
         SigningFixture signing = makeSigningFixture();

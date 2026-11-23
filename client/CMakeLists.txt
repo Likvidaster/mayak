@@ -22,6 +22,16 @@ execute_process(
   OUTPUT_VARIABLE GIT_COMMIT_HASH
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
+# Mayak: a build from uncommitted tracked changes says so (5.1.0.27 showed the hash of an older commit).
+execute_process(
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  COMMAND git status --porcelain --untracked-files=no
+  OUTPUT_VARIABLE GIT_DIRTY_FILES
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(GIT_COMMIT_HASH AND NOT GIT_DIRTY_FILES STREQUAL "")
+  set(GIT_COMMIT_HASH "${GIT_COMMIT_HASH}-dirty")
+endif()
 
 add_definitions(-DGIT_COMMIT_HASH="${GIT_COMMIT_HASH}")
 

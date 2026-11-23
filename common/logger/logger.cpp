@@ -3,8 +3,10 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QMetaEnum>
+#include <QMutex>
 #include <QStandardPaths>
 
 #include "core/utils/utilities.h"
@@ -18,6 +20,31 @@ QFile Logger::m_file;
 QTextStream Logger::m_textStream;
 QString Logger::m_logFileName = QString("%1.log").arg(APPLICATION_NAME);
 QString Logger::m_serviceLogFileName = QString("%1.log").arg(SERVICE_NAME);
+
+namespace
+{
+    bool g_mayakNetJournal = false;
+    QString g_mayakNetJournalTestPath;
+    QtMessageHandler g_previousHandler = nullptr;
+    constexpr qint64 kMayakNetJournalBytes = 1024 * 1024;
+
+    // One line per "MayakNet " event; the previous file is kept as ".1" (at most ~2 MB in all).
+    void appendMayakNetJournal(const QString &line)
+    {
+        static QMutex mutex;
+        QMutexLocker lock(&mutex);
+        const QString path = Logger::mayakNetJournalPath();
+        if (path.isEmpty()) return;
+        QFile file(path);
+        if (file.size() > kMayakNetJournalBytes) {
+            QFile::remove(path + ".1");
+            QFile::rename(path, path + ".1");
+        }
+        if (!file.open(QIODevice::Append | QIODevice::Text)) return;
+        file.write(line.toUtf8());
+        file.write("\n");
+    }
+}
 
 void messageHandler(QtMsgType type, const QMessageLogContext &context, const QString &msg)
 {
@@ -74,6 +101,35 @@ bool Logger::init(bool isServiceLogger)
     qInstallMessageHandler(messageHandler);
 
     return true;
+}
+
+void Logger::enableMayakNetJournal()
+{
+    if (g_mayakNetJournal) return;
+    const QString journal = mayakNetJournalPath();
+    if (!journal.isEmpty()) QDir().mkpath(QFileInfo(journal).absolutePath());
+    g_mayakNetJournal = true;
+    g_previousHandler = qInstallMessageHandler(messageHandler);
+}
+
+void Logger::setMayakNetJournalPathForTests(const QString &path)
+{
+    g_mayakNetJournalTestPath = path;
+}
+
+void Logger::disableMayakNetJournalForTests()
+{
+    if (!g_mayakNetJournal) return;
+    g_mayakNetJournal = false;
+    qInstallMessageHandler(g_previousHandler);
+    g_previousHandler = nullptr;
+}
+
+QString Logger::mayakNetJournalPath()
+{
+    if (!g_mayakNetJournalTestPath.isEmpty()) return g_mayakNetJournalTestPath;
+    const QString dir = userLogsDir();
+    return dir.isEmpty() ? QString() : dir + "/MayakNet-events.log";
 }
 
 void Logger::deInit()
@@ -190,6 +246,7 @@ Logger::LogStreamer::~LogStreamer()
         QTextStream logToFile(&m_file);
         logToFile << message << Qt::endl << Qt::flush;
     }
+    if (g_mayakNetJournal && m_data->m_buffer.contains(QLatin1String("MayakNet "))) appendMayakNetJournal(message);
 
     QTextStream logToOutput((m_logLevel == LogLevel::Error) ? stderr : stdout);
     logToOutput << message << Qt::endl << Qt::flush;

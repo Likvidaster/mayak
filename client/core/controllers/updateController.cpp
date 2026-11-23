@@ -188,6 +188,18 @@ UpdateController::UpdateController(SecureAppSettingsRepository *appSettingsRepos
     m_updateSupported = true;
 #endif
 
+    // Mayak 5.1.0.28: a package downloaded by an earlier run is never installed later (a pending
+    // background install lives only in that process; the next check downloads again when needed).
+    // Without this, e.g. a test build's 170 MB installer stayed after the move to the release.
+    {
+        const QString cacheDir = packageCacheDirectory();
+        if (!cacheDir.isEmpty()) {
+            const QStringList stale = QDir(cacheDir).entryList(
+                {QStringLiteral("mayak-update-*.exe"), QStringLiteral("mayak-update-*.apk")}, QDir::Files);
+            for (const QString &name : stale) QFile::remove(QDir(cacheDir).absoluteFilePath(name));
+        }
+    }
+
     m_periodicCheckTimer = new QTimer(this);
     m_periodicCheckTimer->setInterval(kPeriodicCheckIntervalMs);
     connect(m_periodicCheckTimer, &QTimer::timeout, this, &UpdateController::checkForUpdatesAutomatically);
