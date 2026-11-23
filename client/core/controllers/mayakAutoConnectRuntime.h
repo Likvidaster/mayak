@@ -61,7 +61,9 @@ public:
         bool noHealthMeansLocalFailure = false;
 #endif
         // The first retry repairs WinTun in the service first (see healWintunFirst), so it comes sooner.
-        QList<qint64> localStartRetryMs { 10000, 30000, 60000, 120000, 240000, 300000 };
+        // 5.1.0.28: three short retries, then «перезагрузите компьютер» (a field device waited up to
+        // 5 min between 13 attempts on the same exit while its adapter could not come up).
+        QList<qint64> localStartRetryMs { 10000, 30000, 60000 };
         // The "proven" report after a passing tunnel probe. The first try keeps its short budget
         // (it never delays «Подключено»); a try that got no answer from the server (timeout,
         // network) is repeated in the background with these delays while the same attempt stays

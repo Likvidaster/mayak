@@ -2187,6 +2187,19 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
         QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
     }
+    // ---- Every exit gets its own selection budget (5.1.0.28, review 02 item 2) ----
+    void nextExitIsTriedAfterTheFirstUsedTheWholeBudget() {
+        FastRecoveryTiming timing; CoordinatorTimingGuard guard;
+        auto& t=mayak::autoconnect::Coordinator::timing();
+        t.cycleMs=1500; t.cycleWithXrayMs=1500; t.startMs=1000; t.awgVerifyMs=2500; // one exit can use it all
+        World w; w.silentFirst=true; // the first exit never answers a handshake
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,15000);
+        QCOMPARE(w.events.count("config"),1); // in the same cycle, not after a connect retry
+        QCOMPARE(w.acquireCandidate(0),w.first);
+        QCOMPARE(w.lastAcquireCandidate(),w.second);
+        settle(w);
+    }
     // ---- Proven again when the app comes back (Android froze the UI process; review 02 item 5) ----
     void provenIsSentAgainWhenTheAppComesBack() {
         FastRecoveryTiming timing; OfflineTiming offline; World w;
@@ -2693,7 +2706,7 @@ private slots:
         QVERIFY(!defaults.noHealthMeansLocalFailure);
 #endif
         // The first retry repairs WinTun first, so it comes sooner; the total budget stays.
-        QCOMPARE(defaults.localStartRetryMs,(QList<qint64>{10000,30000,60000,120000,240000,300000}));
+        QCOMPARE(defaults.localStartRetryMs,(QList<qint64>{10000,30000,60000})); // 5.1.0.28: shorter, then «перезагрузите компьютер»
     }
     void localAdapterRetryIsCancelledByUser() {
         FastRecoveryTiming timing; useWindowsHealthMeaning();
