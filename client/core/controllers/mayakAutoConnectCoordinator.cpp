@@ -137,7 +137,7 @@ void Coordinator::onFetch(CycleId c, AttemptId a, FetchStatus result, Snapshot s
         fail(ErrorCategory::Malformed); return;
     }
     // The 30 s selection budget starts once a fresh candidate snapshot exists.
-    snapshotExpiresAt_ = snapshot.expiresAt;
+    snapshotExpiresAt_ = std::min(snapshot.expiresAt, now + timing().cycleCeilingMs);
     overallDeadline_ = std::min(now + timing().cycleMs, snapshotExpiresAt_);
     std::unordered_set<std::string> ids, ips;
     for (const auto& candidate : snapshot.candidates) {

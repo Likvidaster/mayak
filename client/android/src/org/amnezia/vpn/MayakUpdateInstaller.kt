@@ -211,6 +211,12 @@ object MayakUpdateInstaller {
      */
     fun dropStalePending(context: Context): Boolean {
         val app = context.applicationContext
+        // 5.1.0.28: a download killed half-way leaves its file until the next download; after an update
+        // (or at start) such leftovers older than 10 minutes go now (a running download is younger).
+        runCatching {
+            File(app.noBackupFilesDir, "mayak-update").listFiles()
+                ?.filter { System.currentTimeMillis() - it.lastModified() > 10 * 60 * 1000L }?.forEach { it.delete() }
+        }
         val prefs = pendingPrefs(app)
         val sessionId = prefs.getInt(KEY_PENDING_SESSION, -1)
         if (sessionId < 0) return false
