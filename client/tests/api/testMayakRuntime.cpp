@@ -18,6 +18,7 @@
 #include <QUuid>
 #include "core/utils/mayakTunnelProbe.h"
 #include "core/controllers/mayakAutoConnectRuntime.h"
+#include "logger.h"
 #include "version.h"
 #include "core/controllers/mayakAutoConnectCoordinator.h"
 #include "core/controllers/mayakAttemptStore.h"
@@ -2185,6 +2186,30 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Disconnected,5000);
         QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
         QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
+    }
+    // ---- Always-on MayakNet journal (5.1.0.28, review 02 item 4) ----
+    void mayakNetJournalKeepsOnlyEventsAndRotates() {
+        QTemporaryDir dir; QVERIFY(dir.isValid());
+        const QString path=dir.filePath("MayakNet-events.log");
+        Logger::setMayakNetJournalPathForTests(path);
+        Logger::enableMayakNetJournal();
+        qInfo().noquote() << "MayakNet event=journal_test value=1";
+        qInfo().noquote() << "Unrelated message https://example.org";
+        QFile file(path); QVERIFY(file.open(QIODevice::ReadOnly));
+        const QByteArray first=file.readAll(); file.close();
+        QVERIFY(first.contains("MayakNet event=journal_test value=1"));
+        QVERIFY(!first.contains("Unrelated message"));
+        // Rotation: never more than ~1 MB in the current file, the previous one kept as ".1".
+        const QString filler(120,QLatin1Char('x'));
+        for (int i=0;i<10000;++i) qInfo().noquote() << "MayakNet event=fill" << filler;
+        Logger::disableMayakNetJournalForTests();
+        Logger::setMayakNetJournalPathForTests({});
+        QVERIFY(QFile::exists(path+".1"));
+        QVERIFY(QFileInfo(path).size()<=1024*1024+4096);
+        QVERIFY(QFileInfo(path+".1").size()<=1024*1024+4096);
+        const qint64 before=QFileInfo(path).size();
+        qInfo().noquote() << "MayakNet event=after_disable";
+        QCOMPARE(QFileInfo(path).size(),before);
     }
     void offlineMemoryStoresOfferedExitsAndAdmittedConfig() {
         FastRecoveryTiming timing; OfflineTiming offline; World w;

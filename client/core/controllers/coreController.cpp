@@ -316,6 +316,9 @@ void CoreController::initAppleController()
 void CoreController::initLogging()
 {
 #ifndef Q_OS_ANDROID
+    // Mayak: the app's "MayakNet" events are always kept in a small rotated journal (no addresses),
+    // so a connection problem can be read even when the full log is off (review 02, item 4).
+    Logger::enableMayakNetJournal();
     bool enabled = m_appSettingsRepository->isSaveLogs();
     if (enabled) {
         if (!Logger::init(false)) {
