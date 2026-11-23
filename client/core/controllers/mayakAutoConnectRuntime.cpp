@@ -576,6 +576,8 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         bool offlineFailCounted = false;
         bool releaseDeferred = false; // its release got no answer and was moved to the deferred cleanup
         bool invalidRetried = false;  // a normal acquire refused with INVALID_REQUEST was repeated as late
+        bool provenDelivered = false; // the server answered this attempt's "proven"
+        bool provenInFlight = false;  // a "proven" post of this attempt is waiting for its answer
         bool releasePending = false, releaseCallbackHandled = false, releaseLateHandled = false;
         quint64 releaseOperationId = 0;
         bool reset = false;
@@ -2327,12 +2329,14 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         req.cycleToken=a->identity.cycleToken; req.allocationId=allocation; req.commonPayload=common;
         req.deadlineUtcMs=utcDeadline(now()+budget);
         std::weak_ptr<Session> weak=shared_from_this();
+        a->provenInFlight=true;
         ad::MayakAdmissionClient::postAsync(req,transport,[weak,a,c,n,tryIndex,delivered,allocation,first](ad::Response r) {
+            a->provenInFlight=false;
             if (first) first();
             auto self=weak.lock(); if (!self || *delivered) return;
             // Any authenticated server reply means the report arrived; only a missing reply is repeated.
             if (r.responseValid || r.isError || (r.authenticatedResponse && r.transportError==amnezia::ErrorCode::NoError)) {
-                *delivered=true;
+                *delivered=true; a->provenDelivered=true;
                 if (r.isError && (r.error.code=="REVOKED" || r.error.code=="ACCOUNT_EXPIRED"))
                     self->offlineWipe(r.error.code=="REVOKED" ? "revoked" : "expired");
                 if (tryIndex>0 || !r.success)
@@ -2775,7 +2779,18 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         logNet(QStringLiteral("event=ui_%1").arg(visible ? QStringLiteral("visible") : QStringLiteral("hidden")));
         if (!visible) return;
         // Back in front: health resumes now; give it one interval before judging its age.
-        if (auto a=connectedAttempt(); a && !a->cancelled) { a->healthAt=now(); lastMonitor=now(); }
+        if (auto a=connectedAttempt(); a && !a->cancelled) {
+            a->healthAt=now(); lastMonitor=now();
+            // Android freezes this (UI) process in the background; a "proven" that got no answer
+            // before that is sent again now (review 02, item 5). Late proven: the place keeps its
+            // first connect time on the server.
+            const auto s=coordinator->status();
+            if (!a->provenDelivered && !a->provenInFlight && (!a->offline || a->allocation!=a->offlineHandle) &&
+                provenStillWanted(s.cycle,s.attempt,a,a->allocation)) {
+                logNet(QStringLiteral("event=proven_report result=resend reason=ui_visible"));
+                sendProven(s.cycle,s.attempt,a,recoveryTimingStorage().provenRetryBudgetMs,0,std::make_shared<bool>(false),a->allocation,{});
+            }
+        }
     }
     void startRecover(const std::shared_ptr<Attempt>& a) {
         const auto& t=recoveryTimingStorage();

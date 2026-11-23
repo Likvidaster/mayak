@@ -2187,6 +2187,24 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
         QTRY_VERIFY_WITH_TIMEOUT(!w.runtime->busy(),5000);
     }
+    // ---- Proven again when the app comes back (Android froze the UI process; review 02 item 5) ----
+    void provenIsSentAgainWhenTheAppComesBack() {
+        FastRecoveryTiming timing; OfflineTiming offline; World w;
+        w.failProvenCount=100; // no answer to any "proven" (frozen / slow network)
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(w.provenCalls,3,5000); // first try + 2 retries, then given up
+        QTest::qWait(400);
+        QCOMPARE(w.provenCalls,3);
+        QVERIFY(w.observeVisibility);
+        w.failProvenCount=0;
+        w.observeVisibility(false); w.observeVisibility(true);
+        QTRY_COMPARE_WITH_TIMEOUT(w.provenCalls,4,3000);
+        w.observeVisibility(false); w.observeVisibility(true); // delivered now: not again
+        QTest::qWait(300);
+        QCOMPARE(w.provenCalls,4);
+        settle(w);
+    }
     // ---- Always-on MayakNet journal (5.1.0.28, review 02 item 4) ----
     void mayakNetJournalKeepsOnlyEventsAndRotates() {
         QTemporaryDir dir; QVERIFY(dir.isValid());
