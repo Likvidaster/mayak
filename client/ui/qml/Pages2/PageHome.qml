@@ -24,6 +24,11 @@ PageType {
         return (city.length > 0 ? city + " · " : "") + routeMethod
     })()
     readonly property string routeLine: routeText.length > 0 ? "\n" + routeText : ""
+    // Owner's manual exit (MayakExitChoice exists in 5.1.0.29+; hidden without the gateway's list).
+    readonly property bool exitChoiceAvailable: typeof MayakExitChoice !== "undefined" && MayakExitChoice.available
+    readonly property bool exitChoiceEditable: root.waitingPhase === "" && ["Idle", "Failed", "Cancelled"].indexOf(connectButton.archivePhase) >= 0
+    readonly property string exitChoiceTitle: !exitChoiceAvailable || MayakExitChoice.selectedId === "" ? qsTr("Авто")
+        : MayakExitChoice.selectedCity + (MayakExitChoice.selectedOffered ? "" : qsTr(" (недоступен)"))
     property bool cityDetailsOpen: false
     property real detailsProgress: 0
     readonly property real detailsBodyOpacity: Math.max(0, 2 * detailsProgress - 1)
@@ -205,8 +210,28 @@ PageType {
         }
         BodyTextType {
             objectName: "mayak-home-helper"; Layout.fillWidth: true; Layout.minimumHeight: 40
-            visible: !root.cityVisible && !root.cityDetailsOpen && !connectButton.showUnknownCityCard; text: qsTr("Выход выбирается автоматически")
+            visible: !root.cityVisible && !root.cityDetailsOpen && !connectButton.showUnknownCityCard && !root.exitChoiceAvailable
+            text: qsTr("Выход выбирается автоматически")
             horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; color: AmneziaStyle.color.mayakInkMuted
+        }
+        // Owner only (the gateway sends the list only to the owner's account): manual exit, «Авто» by
+        // default. Changed only while Mayak is off; used from the next connect.
+        Button {
+            id: exitChoiceButton; objectName: "mayak-exit-choice"
+            Layout.alignment: Qt.AlignHCenter
+            Layout.preferredWidth: Math.min(380, root.width - 36); Layout.preferredHeight: 44
+            visible: root.exitChoiceAvailable && !root.cityVisible && !root.cityDetailsOpen && !connectButton.showUnknownCityCard
+            enabled: root.exitChoiceEditable
+            text: qsTr("Сервер: %1").arg(root.exitChoiceTitle) + "  ▾"; Accessible.name: qsTr("Сервер: %1").arg(root.exitChoiceTitle)
+            font.family: AmneziaStyle.uiFontFamily; font.pixelSize: 15
+            onClicked: exitChoicePopup.open()
+            contentItem: Text { text: parent.text; font: parent.font; color: exitChoiceButton.enabled ? AmneziaStyle.color.mayakInk : AmneziaStyle.color.mayakInkMuted; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+            background: Rectangle {
+                radius: 14
+                color: exitChoiceButton.down ? AmneziaStyle.color.mayakSurface2 : AmneziaStyle.color.mayakSurface1
+                border.width: exitChoiceButton.visualFocus ? 2 : 1
+                border.color: exitChoiceButton.visualFocus ? AmneziaStyle.color.mayakFocus : AmneziaStyle.color.mayakLine
+            }
         }
         // «Россия напрямую» and split tunneling: changed only while Mayak is off (applied on connect).
         ColumnLayout {
@@ -518,6 +543,42 @@ PageType {
     }
 
     HomeSplitTunnelingDrawer { id: splitDrawer; parent: root }
+
+    // Owner's server list: «Авто» first, then the exits the gateway offered (reserve = not in auto selection).
+    Popup {
+        id: exitChoicePopup; objectName: "mayak-exit-choice-menu"
+        parent: Overlay.overlay
+        modal: true; focus: true; padding: 8
+        width: Math.min(360, (parent ? parent.width : root.width) - 32)
+        x: Math.round(((parent ? parent.width : root.width) - width) / 2)
+        y: Math.round(((parent ? parent.height : root.height) - height) / 2)
+        onAboutToShow: exitChoiceList.model = root.exitChoiceAvailable
+            ? [{ id: "", city: qsTr("Авто"), auto: true, hint: qsTr("Выход выбирается автоматически") }].concat(MayakExitChoice.exits) : []
+        background: Rectangle { radius: 18; color: AmneziaStyle.color.mayakSurface1; border.width: 1; border.color: AmneziaStyle.color.mayakLine }
+        contentItem: ListView {
+            id: exitChoiceList; objectName: "mayak-exit-choice-list"
+            implicitHeight: Math.min(contentHeight, root.height * 0.7)
+            clip: true; boundsBehavior: Flickable.StopAtBounds
+            header: Text { width: exitChoiceList.width; padding: 10; text: qsTr("Сервер подключения"); color: AmneziaStyle.color.mayakInk; font.family: AmneziaStyle.uiFontFamily; font.pixelSize: 17; font.weight: Font.DemiBold; wrapMode: Text.WordWrap }
+            delegate: Button {
+                id: exitItem
+                required property var modelData
+                readonly property bool chosen: typeof MayakExitChoice !== "undefined" && modelData.id === MayakExitChoice.selectedId
+                readonly property string hint: typeof modelData.hint === "string" ? modelData.hint : (modelData.auto ? "" : qsTr("Резерв — не в автовыборе"))
+                width: exitChoiceList.width; height: Math.max(48, itemColumn.implicitHeight + 16)
+                Accessible.name: modelData.city + (hint.length > 0 ? ", " + hint : "")
+                onClicked: { MayakExitChoice.select(modelData.id); exitChoicePopup.close() }
+                contentItem: RowLayout { spacing: 8
+                    ColumnLayout { id: itemColumn; Layout.fillWidth: true; spacing: 2
+                        Text { Layout.fillWidth: true; text: exitItem.modelData.city; textFormat: Text.PlainText; color: AmneziaStyle.color.mayakInk; font.family: AmneziaStyle.uiFontFamily; font.pixelSize: 16; font.weight: exitItem.chosen ? Font.DemiBold : Font.Normal; elide: Text.ElideRight }
+                        Text { Layout.fillWidth: true; visible: exitItem.hint.length > 0; text: exitItem.hint; color: AmneziaStyle.color.mayakInkMuted; font.family: AmneziaStyle.uiFontFamily; font.pixelSize: 13; wrapMode: Text.WordWrap }
+                    }
+                    Text { visible: exitItem.chosen; text: "✓"; color: AmneziaStyle.color.mayakInk; font.pixelSize: 18; Accessible.ignored: true }
+                }
+                background: Rectangle { radius: 12; color: exitItem.down || exitItem.chosen ? AmneziaStyle.color.mayakSurface2 : "transparent"; border.width: exitItem.visualFocus ? 2 : 0; border.color: AmneziaStyle.color.mayakFocus }
+            }
+        }
+    }
 
     Keys.onEscapePressed: if (cityDetailsOpen) collapseDetails()
     Keys.onBackPressed: if (cityDetailsOpen) collapseDetails()

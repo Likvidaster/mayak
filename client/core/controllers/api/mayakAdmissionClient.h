@@ -24,6 +24,14 @@ struct Candidate {
     QStringList expectedEgressIps;
 };
 
+// One exit the owner may pick by hand (field manual_exits, owner accounts only). The candidate part is
+// validated like candidates; city is display-only plain text; autoSelect = the exit is in auto selection.
+struct ManualExit {
+    Candidate candidate;
+    QString city;
+    bool autoSelect = false;
+};
+
 struct ConnectionCapability {
     int schema = 0;
     qint64 revision = 0;
@@ -32,6 +40,9 @@ struct ConnectionCapability {
     // Optional (server of 23.11.2026): until when this device may connect from its stored exits
     // without an answer from the gateway. Invalid/absent = unknown (the client uses its own bound).
     QDateTime offlineUntil;
+    // Optional (5.1.0.29): every ready exit for the owner's manual choice. Absent or malformed = not
+    // offered (empty); a malformed list never rejects the capability above.
+    QList<ManualExit> manualExits;
 };
 
 struct AdmissionError {
@@ -127,6 +138,8 @@ using Completion = std::function<void(Response)>;
 
 bool parseConnectionCapability(const QByteArray &responseBody, const QDateTime &nowUtc, ConnectionCapability *out,
                                QString *failure = nullptr);
+// Strict shape of manual_exits: 1..16 objects {id, host, port, expected_egress_ips, city, auto}, unique ids and hosts.
+bool parseManualExits(const QJsonValue &value, QList<ManualExit> *out, QString *failure = nullptr);
 bool parseAcquireResponse(const QByteArray &responseBody, AcquireResponse *out, QString *failure = nullptr,
                           bool allowPastConnectBefore = false);
 // Strict shape of xray_paths: schema 1, 1..4 unique paths, id "xray-<fp>", known fingerprint, vpn:// config.

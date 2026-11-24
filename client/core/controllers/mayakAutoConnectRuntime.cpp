@@ -22,6 +22,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <QJsonArray>
+#include <QJsonObject>
 #include <QNetworkInterface>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -449,6 +450,20 @@ QString errorText(ac::ErrorCategory e) {
     default: return QStringLiteral("Не удалось подключиться к доступному серверу. Проверьте интернет и повторите попытку.");
     }
 }
+QString manualName(const QString& city) {
+    return city.isEmpty() ? QStringLiteral("Выбранный сервер") : QStringLiteral("Сервер «%1»").arg(city);
+}
+QString manualMissingText(const QString& city) {
+    return manualName(city)+QStringLiteral(" сейчас недоступен для подключения. Выберите «Авто» или другой сервер.");
+}
+QString manualFailedText(const QString& city,ac::ErrorCategory e) {
+    switch(e) {
+    case ac::ErrorCategory::Capacity: return manualName(city)+QStringLiteral(" занят. Выберите «Авто» или другой сервер.");
+    case ac::ErrorCategory::NotReady: return manualName(city)+QStringLiteral(" готовит доступ. Повторите подключение через несколько секунд.");
+    case ac::ErrorCategory::Unsupported: return errorText(e);
+    default: return manualName(city)+QStringLiteral(" не подключился. Выберите «Авто» или другой сервер.");
+    }
+}
 }
 
 // Callbacks retain Session, not UI or repositories. Every remote effect carries
@@ -485,6 +500,10 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
     bool offlineRevoked = false;
     ac::ErrorCategory lateTerminal = ac::ErrorCategory::None;
     QString fetchRefusalText; // a signed v1/config refusal with its own message (no retries)
+    // Owner's manual exit (5.1.0.29), fixed at session start: "" = «Авто». A chosen exit is the only
+    // candidate of every cycle (no exit memory, no connect without the gateway, no other exit).
+    QString manualExit;
+    QString manualCity;
     // Windows: the service could not apply the user's app exclusions (split tunnel driver unavailable).
     // The cycle ends with a clear error instead of retrying or falling back to a path without exclusions.
     qint64 sessionStartMono = mayak::split::monotonicNowMs();
@@ -924,8 +943,10 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
         }
         remembered=rememberedExit(settings,networkKey);
         offlineOwnerKey=offlineOwner(serverId,keys.wireGuardClientPubKey,authority.deviceApiKey);
-        logNet(QStringLiteral("event=connection_method method=%1 xray_first=%2 remembered_exit=%3 offline_memory=%4").arg(method)
-            .arg(rememberedXrayFirst(settings,networkKey) ? 1 : 0).arg(remembered.valid() ? 1 : 0).arg(offlineUsable() ? 1 : 0));
+        manualExit=app->mayakManualExit(); manualCity=app->mayakManualExitCity();
+        logNet(QStringLiteral("event=connection_method method=%1 xray_first=%2 remembered_exit=%3 offline_memory=%4 manual_exit=%5").arg(method)
+            .arg(rememberedXrayFirst(settings,networkKey) ? 1 : 0).arg(remembered.valid() ? 1 : 0).arg(offlineUsable() ? 1 : 0)
+            .arg(manualExit.isEmpty() ? 0 : 1));
         preflightDeadline=now()+10000;
         inspectPreflight();
         timer.start();
@@ -1324,6 +1345,10 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
                 // A dead connected exit is being replaced (another exit first): not an error.
                 terminal=false; phase=QStringLiteral("preparing");
                 output(Vpn::ConnectionState::Preparing,QStringLiteral("Сервер не отвечает — переподключаемся…"));
+            } else if (!manualExit.isEmpty() && !cancelled && s.error!=ac::ErrorCategory::AuthRevoked &&
+                       s.error!=ac::ErrorCategory::AccountExpired) {
+                // Owner's choice: only that exit was tried; say so instead of "no available server".
+                output(Vpn::ConnectionState::Error,manualFailedText(manualCity,s.error));
             } else output(Vpn::ConnectionState::Error,errorText(s.error));
             break;
         case ac::State::Cancelled: case ac::State::Idle:
@@ -1548,7 +1573,7 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             ad::ConnectionCapability cap;
             const bool capOk=!isError && r.authenticatedResponse && ad::parseConnectionCapability(r.body,QDateTime::currentDateTimeUtc(),&cap);
             if (isError && (err.code=="REVOKED" || err.code=="ACCOUNT_EXPIRED")) self->offlineWipe(err.code=="REVOKED" ? "revoked" : "expired");
-            if (capOk) self->offlineRememberCapability(cap);
+            if (capOk) { self->offlineRememberCapability(cap); self->rememberManualExits(cap); }
             if (*offlineOwned) {
                 // The stored exits own this cycle: a revoked/expired answer ends that session.
                 if (isError && (err.code=="REVOKED" || err.code=="ACCOUNT_EXPIRED"))
@@ -1612,7 +1637,24 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
             auto self=shared_from_this();
             ac::Snapshot s; s.schemaVersion=cap.schema; s.revision=QString::number(cap.revision).toStdString();
             s.expiresAt=self->now()+QDateTime::currentDateTimeUtc().msecsTo(cap.expiresAt);
-            for(const auto& v:cap.candidates) {
+            // Owner's manual exit: the only candidate. Not offered any more (another role) = «Авто»;
+            // offered without the chosen exit = a clear refusal, never another exit.
+            QList<ad::Candidate> offered=cap.candidates;
+            if (!self->manualExit.isEmpty() && !self->adoption.pending && !cap.manualExits.isEmpty()) {
+                const auto it=std::find_if(cap.manualExits.begin(),cap.manualExits.end(),[&self](const ad::ManualExit& x) {
+                    return x.candidate.id.compare(self->manualExit,Qt::CaseInsensitive)==0; });
+                if (it==cap.manualExits.end()) {
+                    self->logNet(QStringLiteral("event=manual_exit_missing"));
+                    self->fetchRefusalText=manualMissingText(self->manualCity);
+                    done(c,a,ac::FetchStatus::NetworkError,{}); return;
+                }
+                offered={it->candidate};
+                self->logNet(QStringLiteral("event=manual_exit auto=%1").arg(it->autoSelect ? 1 : 0));
+            } else if (!self->manualExit.isEmpty() && !self->adoption.pending) {
+                self->logNet(QStringLiteral("event=manual_exit_not_offered"));
+                self->manualExit.clear(); self->manualCity.clear();
+            }
+            for(const auto& v:offered) {
                 ac::Candidate x{v.id.toStdString(),v.host.toStdString(),v.port,v.preferred,{}};
                 for(const auto& ip:v.expectedEgressIps) x.expectedEgressIps.push_back(ip.toStdString());
                 s.candidates.push_back(std::move(x));
@@ -2378,11 +2420,19 @@ struct MayakAutoConnectRuntime::Session : QObject, ac::Adapter, ac::Clock,
     }
     // ---------- Connect without the gateway (see OfflineMemory) ----------
     static qint64 utcNowMs() { return QDateTime::currentMSecsSinceEpoch(); }
-    bool offlineUsable() const { return loadOfflineMemory(settings).usable(offlineOwnerKey,utcNowMs()); }
+    bool offlineUsable() const { return manualExit.isEmpty() && loadOfflineMemory(settings).usable(offlineOwnerKey,utcNowMs()); }
     void offlineWipe(const char* reason) {
         if (!settings || settings->storedValueClass(kOfflineMemoryKey)==SecureQSettings::StoredValueClass::Missing) return;
         settings->remove(kOfflineMemoryKey);
         logNet(QStringLiteral("event=offline_memory_wiped reason=%1").arg(QLatin1String(reason)));
+    }
+    // A signed v1/config: the owner's manual exit list for the home screen (empty = not offered).
+    void rememberManualExits(const ad::ConnectionCapability& cap) {
+        if (!app) return;
+        QJsonArray list;
+        for (const auto& x:cap.manualExits)
+            list.append(QJsonObject{{QStringLiteral("id"),x.candidate.id},{QStringLiteral("city"),x.city},{QStringLiteral("auto"),x.autoSelect}});
+        app->setMayakManualExits(list);
     }
     // A signed v1/config: the offered exits (configs of the same exit and address are kept) and the bound.
     void offlineRememberCapability(const ad::ConnectionCapability& cap) {

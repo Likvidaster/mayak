@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <tuple>
 #include <QApplication>
 #include <QJsonArray>
 #include <QElapsedTimer>
@@ -211,6 +212,12 @@ struct World : QObject {
     std::function<void(bool)> observeVisibility;
     std::function<void(B::Ticket)> observeFailover;
     bool silentFirst=false, singleCandidate=false;
+    // Owner's manual exits (5.1.0.29): v1/config offers first, second and a reserve third exit.
+    QString third=guid();
+    bool offerManual=false, manualWithoutThird=false;
+    QString hostOf(const QString& candidate) const {
+        return candidate==first ? QStringLiteral("81.29.149.103") : candidate==third ? QStringLiteral("81.29.149.105") : QStringLiteral("81.29.149.104");
+    }
     QString silentHost;      // AWG on this exit host never answers a handshake (no valid health)
     QString xrayDeadHost;    // Xray on this exit host never comes up
     // Port precheck fixture (never real addresses): hosts listed here do not answer.
@@ -544,14 +551,26 @@ struct World : QObject {
                 candidates.append(QJsonObject{{"id",candidate},{"host",candidate==first?"81.29.149.103":"81.29.149.104"},
                 {"port",49963},{"preferred",candidate==first},{"expected_egress_ips",QJsonArray{"81.29.149.103"}}});
             }
-            response={{"mayak_connection",QJsonObject{{"schema",1},{"revision",14},{"expires_at",QDateTime::currentDateTimeUtc().addSecs(60).toString(Qt::ISODateWithMs)},{"candidates",candidates}}}};
+            QJsonObject capability{{"schema",1},{"revision",14},{"expires_at",QDateTime::currentDateTimeUtc().addSecs(60).toString(Qt::ISODateWithMs)},{"candidates",candidates}};
+            if (offerManual) {
+                const QList<std::tuple<QString,QString,bool>> exits{
+                    {first,QStringLiteral("Рига"),true},{second,QStringLiteral("Париж"),true},{third,QStringLiteral("Таллин"),false}};
+                QJsonArray manual;
+                for (const auto& [candidate,city,autoSelect]:exits) {
+                    if (manualWithoutThird && candidate==third) continue;
+                    manual.append(QJsonObject{{"id",candidate},{"host",hostOf(candidate)},{"port",49963},
+                        {"expected_egress_ips",QJsonArray{"81.29.149.103"}},{"city",city},{"auto",autoSelect}});
+                }
+                capability.insert("manual_exits",manual);
+            }
+            response={{"mayak_connection",capability}};
             delay=configDelay;
             if (!configError.isEmpty()) response=configError;
         } else {
             const auto action=payload.value("action").toString();events<<action;
             if(action=="acquire") {
                 publicKey=payload.value("public_key").toString();
-                selectedHost=payload.value("candidate_id").toString()==first?"81.29.149.103":"81.29.149.104";
+                selectedHost=hostOf(payload.value("candidate_id").toString());
                 ++acquires; delay=acquireDelay;
                 if (invalidNextAcquire) { invalidNextAcquire=false; response={{"http_status",400},{"code","INVALID_REQUEST"},{"message","open place"}}; }
                 else if(fullFirst && acquires==1) response={{"http_status",409},{"code","FULL"},{"message","full"}};
@@ -3604,6 +3623,114 @@ private slots:
         QTest::qWait(400);
         QCOMPARE(w.events.count("config_fail"),fails);
         QCOMPARE(w.acquires,0); QCOMPARE(w.records(),0);
+    }
+
+    // Owner's manual exit (5.1.0.29). The list comes with v1/config; a chosen exit is the only candidate.
+    static void fillManualList(World& w) {
+        w.offerManual=true;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.app.mayakManualExits().size(),3);
+        QVERIFY(w.app.mayakManualExit().isEmpty()); // «Авто» by default
+        settle(w);
+    }
+    void manualExitIsTheOnlyCandidate() {
+        FastRecoveryTiming timing; World w(true);
+        fillManualList(w);
+        QVERIFY(w.app.setMayakManualExit(w.third)); // a reserve exit: not among the auto candidates
+        QCOMPARE(w.app.mayakManualExitCity(),QStringLiteral("Таллин"));
+        const int acquires=w.acquires;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.acquires,acquires+1);
+        QCOMPARE(w.lastAcquireCandidate(),w.third);
+        QVERIFY(w.startHosts.last().startsWith(QStringLiteral("81.29.149.105/")));
+        settle(w);
+    }
+    void manualExitFailureNamesTheServerAndTriesNoOther() {
+        FastRecoveryTiming timing; World w(true);
+        fillManualList(w);
+        QVERIFY(w.app.setMayakManualExit(w.third));
+        w.silentHost=QStringLiteral("81.29.149.105");
+        const int acquires=w.acquires;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,25000);
+        QVERIFY2(w.runtime->message().contains(QStringLiteral("«Таллин»")),qPrintable(w.runtime->message()));
+        QVERIFY(w.acquires>acquires);
+        for (int n=acquires;n<w.acquires;++n) QCOMPARE(w.acquireCandidate(n),w.third);
+        QCOMPARE(w.app.mayakManualExit(),w.third); // the choice stays
+        QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
+    }
+    void manualExitMissingFromTheListIsAClearError() {
+        FastRecoveryTiming timing; World w(true);
+        fillManualList(w);
+        QVERIFY(w.app.setMayakManualExit(w.third));
+        w.manualWithoutThird=true;
+        const int acquires=w.acquires;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Error,10000);
+        QVERIFY2(w.runtime->message().contains(QStringLiteral("«Таллин» сейчас недоступен")),qPrintable(w.runtime->message()));
+        QCOMPARE(w.acquires,acquires);
+        QCOMPARE(w.app.mayakManualExit(),w.third);     // still chosen, named as unavailable on the screen
+        QCOMPARE(w.app.mayakManualExits().size(),2);
+        QTRY_COMPARE_WITH_TIMEOUT(w.records(),0,5000);
+    }
+    void manualListNotOfferedReturnsToAuto() {
+        FastRecoveryTiming timing; World w(true);
+        fillManualList(w);
+        QVERIFY(w.app.setMayakManualExit(w.third));
+        w.offerManual=false; // not the owner any more
+        const int acquires=w.acquires;
+        w.runtime->begin(w.id);
+        QTRY_COMPARE_WITH_TIMEOUT(w.state,Vpn::ConnectionState::Connected,10000);
+        QCOMPARE(w.acquireCandidate(acquires),w.first);
+        QVERIFY(w.app.mayakManualExits().isEmpty());
+        QVERIFY(w.app.mayakManualExit().isEmpty());
+        settle(w);
+    }
+    void manualChoiceAcceptsOnlyListedExitsAndEndsWithTheSession() {
+        World w;
+        const QJsonArray list{QJsonObject{{"id",w.first},{"city",QStringLiteral("Рига")},{"auto",true}}};
+        QVERIFY(!w.app.setMayakManualExit(w.first));   // no list yet
+        w.app.setMayakManualExits(list);
+        QVERIFY(!w.app.setMayakManualExit(w.second));  // not offered
+        QVERIFY(w.app.setMayakManualExit(w.first.toUpper()));
+        QCOMPARE(w.app.mayakManualExit(),w.first);
+        QVERIFY(w.app.setMayakManualExit(QString()));
+        QVERIFY(w.app.mayakManualExit().isEmpty());
+        QVERIFY(w.app.setMayakManualExit(w.first));
+        w.app.setMayakSessionToken(QStringLiteral("another-session")); // another sign-in starts at «Авто»
+        QVERIFY(w.app.mayakManualExits().isEmpty());
+        QVERIFY(w.app.mayakManualExit().isEmpty());
+    }
+    void malformedManualListNeverRejectsTheCapability() {
+        const auto now=QDateTime::currentDateTimeUtc();
+        const QJsonObject good{{"id",guid()},{"host","81.29.149.103"},{"port",49963},{"preferred",true},{"expected_egress_ips",QJsonArray{"81.29.149.103"}}};
+        auto body=[&](const QJsonValue& manual) {
+            QJsonObject c{{"schema",1},{"revision",3},{"expires_at",now.addSecs(60).toString(Qt::ISODate)},{"candidates",QJsonArray{good}}};
+            if (!manual.isUndefined()) c.insert("manual_exits",manual);
+            return QJsonDocument(QJsonObject{{"mayak_connection",c}}).toJson(QJsonDocument::Compact);
+        };
+        const QJsonObject exit{{"id",guid()},{"host","81.29.149.105"},{"port",49963},{"expected_egress_ips",QJsonArray{"81.29.149.105"}},
+                               {"city",QStringLiteral("Таллин")},{"auto",false}};
+        mayak::admission::ConnectionCapability cap;
+        QVERIFY(mayak::admission::parseConnectionCapability(body(QJsonArray{exit}),now,&cap));
+        QCOMPARE(cap.manualExits.size(),1);
+        QCOMPARE(cap.manualExits.first().city,QStringLiteral("Таллин"));
+        QVERIFY(!cap.manualExits.first().autoSelect);
+        QCOMPARE(cap.manualExits.first().candidate.host,QStringLiteral("81.29.149.105"));
+        QJsonObject badCity=exit; badCity["city"]=QStringLiteral("Таллин")+QChar(0x202e);
+        QJsonObject privateHost=exit; privateHost["host"]="10.0.0.1";
+        QJsonObject noAuto=exit; noAuto.remove("auto");
+        const QList<QJsonValue> bad{QJsonArray{},QJsonArray{exit,exit},QJsonArray{badCity},QJsonArray{privateHost},
+                                    QJsonArray{noAuto},QJsonValue(QStringLiteral("x"))};
+        for (const QJsonValue& value:bad) {
+            QVERIFY(mayak::admission::parseConnectionCapability(body(value),now,&cap));
+            QCOMPARE(cap.candidates.size(),1);
+            QVERIFY(cap.manualExits.isEmpty());
+        }
+        QVERIFY(mayak::admission::parseConnectionCapability(body(QJsonValue(QJsonValue::Undefined)),now,&cap));
+        QVERIFY(cap.manualExits.isEmpty());
     }
 };
 int main(int argc,char** argv) {

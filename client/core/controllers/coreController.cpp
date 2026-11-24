@@ -2,6 +2,7 @@
 #include "coreController.h"
 #include "ui/controllers/mayakRoutingUiController.h"
 #include "ui/controllers/mayakCityPhotoUiController.h"
+#include "ui/controllers/mayakExitChoiceUiController.h"
 #include "mayakAutoConnectRuntime.h"
 
 #include <QCoreApplication>
@@ -253,6 +254,8 @@ void CoreController::initControllers()
     m_ipSplitTunnelingUiController = new IpSplitTunnelingUiController(m_ipSplitTunnelingController, m_ipSplitTunnelingModel, this);
     setQmlContextProperty("IpSplitTunnelingController", m_ipSplitTunnelingUiController);
     setQmlContextProperty("MayakRouting", new MayakRoutingUiController(m_appSettingsRepository, this));
+    // Owner only: manual exit under the connect button (hidden while the gateway offers no list).
+    setQmlContextProperty("MayakExitChoice", new MayakExitChoiceUiController(m_appSettingsRepository, this));
     // Server photo of the admin city card; QML requests it only in «Подключено».
     setQmlContextProperty("MayakCityPhoto", new MayakCityPhotoUiController(this));
 

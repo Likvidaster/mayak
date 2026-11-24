@@ -10,6 +10,7 @@
 #include <QVector>
 #include <QDateTime>
 #include <QByteArray>
+#include <QJsonArray>
 
 #include "core/utils/routeModes.h"
 #include "core/utils/commonStructs.h"
@@ -62,6 +63,14 @@ public:
     // Mayak 5.1.0.21: "auto" (AWG, then Xray paths), "awg" or "xray" (owner checks).
     QString mayakConnectionMethod() const;
     void setMayakConnectionMethod(const QString &method);
+    // Mayak 5.1.0.29, owner only: the exits the gateway offered for a manual choice ([{id, city, auto}],
+    // empty = not offered) and the chosen one ("" = «Авто»). An empty list also clears the choice; the
+    // choice keeps its city so an exit that left the list is still named. Cleared on a session change.
+    QJsonArray mayakManualExits() const;
+    void setMayakManualExits(const QJsonArray &exits);
+    QString mayakManualExit() const;
+    QString mayakManualExitCity() const;
+    bool setMayakManualExit(const QString &id); // "" or an id from the list
     bool isMayakRussiaDirectEnabled() const;
     void setMayakRussiaDirectEnabled(bool enabled);
     bool isMayakRussiaDirectNoticeShown() const;
@@ -152,6 +161,8 @@ signals:
     void appsSplitTunnelingEnabledChanged(bool enabled);
     void mayakRussiaDirectEnabledChanged(bool enabled);
     void mayakConnectionMethodChanged(const QString &method);
+    void mayakManualExitsChanged();
+    void mayakManualExitChanged();
     void useAmneziaDnsChanged(bool enabled);
     void saveLogsChanged(bool enabled);
     void screenshotsEnabledChanged(bool enabled);
