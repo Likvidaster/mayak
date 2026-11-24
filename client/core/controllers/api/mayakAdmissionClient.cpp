@@ -185,6 +185,58 @@ bool parseConnectionCapability(const QByteArray &responseBody, const QDateTime &
         const QDateTime until = QDateTime::fromString(offline, Qt::ISODate).toUTC();
         if (until.isValid() && until > nowUtc.toUTC() && until <= nowUtc.toUTC().addDays(31)) out->offlineUntil = until;
     }
+    // Optional owner list: a malformed value never rejects the capability above (no manual choice then).
+    if (obj.contains(QStringLiteral("manual_exits"))) {
+        QList<ManualExit> manual;
+        if (parseManualExits(obj.value(QStringLiteral("manual_exits")), &manual)) out->manualExits = manual;
+    }
+    return true;
+}
+
+bool parseManualExits(const QJsonValue &value, QList<ManualExit> *out, QString *failure)
+{
+    auto fail = [failure](const QString &reason) { if (failure) *failure = reason; return false; };
+    if (!out) return fail(QStringLiteral("no output"));
+    out->clear();
+    if (!value.isArray() || value.toArray().isEmpty() || value.toArray().size() > 16)
+        return fail(QStringLiteral("invalid manual exit list"));
+    QSet<QString> ids;
+    QSet<QString> hosts;
+    QList<ManualExit> list;
+    for (const QJsonValue &item : value.toArray()) {
+        if (!item.isObject()) return fail(QStringLiteral("invalid manual exit"));
+        const QJsonObject c = item.toObject();
+        ManualExit exit;
+        Candidate &candidate = exit.candidate;
+        if (!boundedString(c.value(QStringLiteral("id")), 36, &candidate.id) || !isGuid(candidate.id)
+            || ids.contains(candidate.id.toLower())) return fail(QStringLiteral("invalid or duplicate manual exit id"));
+        ids.insert(candidate.id.toLower());
+        if (!boundedString(c.value(QStringLiteral("host")), 15, &candidate.host) || !isPublicIpv4(candidate.host)
+            || hosts.contains(candidate.host)) return fail(QStringLiteral("invalid or duplicate manual exit host"));
+        hosts.insert(candidate.host);
+        const QJsonValue port = c.value(QStringLiteral("port"));
+        if (!port.isDouble() || port.toDouble() < 1 || port.toDouble() > 65535 || std::floor(port.toDouble()) != port.toDouble())
+            return fail(QStringLiteral("invalid manual exit port"));
+        candidate.port = static_cast<quint16>(port.toInt());
+        const QJsonValue egress = c.value(QStringLiteral("expected_egress_ips"));
+        if (!egress.isArray() || egress.toArray().isEmpty() || egress.toArray().size() > 3)
+            return fail(QStringLiteral("invalid manual exit egress list"));
+        QSet<QString> ips;
+        for (const QJsonValue &ipValue : egress.toArray()) {
+            QString ip;
+            if (!boundedString(ipValue, 15, &ip) || !isPublicIpv4(ip) || ips.contains(ip)) return fail(QStringLiteral("invalid manual exit egress IP"));
+            ips.insert(ip); candidate.expectedEgressIps.push_back(ip);
+        }
+        if (!boundedString(c.value(QStringLiteral("city")), 80, &exit.city)) return fail(QStringLiteral("invalid manual exit city"));
+        for (const QChar ch : exit.city)
+            if (ch.category() == QChar::Other_Control || ch.category() == QChar::Other_Format)
+                return fail(QStringLiteral("invalid manual exit city"));
+        if (!c.value(QStringLiteral("auto")).isBool()) return fail(QStringLiteral("invalid manual exit auto flag"));
+        exit.autoSelect = c.value(QStringLiteral("auto")).toBool();
+        candidate.preferred = true; // the only exit of a manual cycle
+        list.push_back(exit);
+    }
+    *out = list;
     return true;
 }
 

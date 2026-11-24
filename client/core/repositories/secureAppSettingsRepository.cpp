@@ -224,6 +224,52 @@ void SecureAppSettingsRepository::setMayakConnectionMethod(const QString &method
     emit mayakConnectionMethodChanged(normalized);
 }
 
+QJsonArray SecureAppSettingsRepository::mayakManualExits() const
+{
+    return QJsonDocument::fromJson(value(QStringLiteral("Mayak/manualExits")).toByteArray()).array();
+}
+
+void SecureAppSettingsRepository::setMayakManualExits(const QJsonArray &exits)
+{
+    if (exits != mayakManualExits()) {
+        if (exits.isEmpty()) m_settings->remove(QStringLiteral("Mayak/manualExits"));
+        else setValue(QStringLiteral("Mayak/manualExits"), QJsonDocument(exits).toJson(QJsonDocument::Compact));
+        emit mayakManualExitsChanged();
+    }
+    if (exits.isEmpty()) setMayakManualExit(QString());
+}
+
+QString SecureAppSettingsRepository::mayakManualExit() const
+{
+    return QJsonDocument::fromJson(value(QStringLiteral("Mayak/manualExit")).toByteArray()).object().value(QStringLiteral("id")).toString();
+}
+
+QString SecureAppSettingsRepository::mayakManualExitCity() const
+{
+    return QJsonDocument::fromJson(value(QStringLiteral("Mayak/manualExit")).toByteArray()).object().value(QStringLiteral("city")).toString();
+}
+
+bool SecureAppSettingsRepository::setMayakManualExit(const QString &id)
+{
+    if (id.isEmpty()) {
+        if (mayakManualExit().isEmpty()) return true;
+        m_settings->remove(QStringLiteral("Mayak/manualExit"));
+        emit mayakManualExitChanged();
+        return true;
+    }
+    for (const QJsonValue &item : mayakManualExits()) {
+        const QJsonObject exit = item.toObject();
+        if (exit.value(QStringLiteral("id")).toString().compare(id, Qt::CaseInsensitive) != 0) continue;
+        const QJsonObject choice{{QStringLiteral("id"), exit.value(QStringLiteral("id")).toString()},
+                                 {QStringLiteral("city"), exit.value(QStringLiteral("city")).toString()}};
+        if (QJsonDocument::fromJson(value(QStringLiteral("Mayak/manualExit")).toByteArray()).object() == choice) return true;
+        setValue(QStringLiteral("Mayak/manualExit"), QJsonDocument(choice).toJson(QJsonDocument::Compact));
+        emit mayakManualExitChanged();
+        return true;
+    }
+    return false;
+}
+
 bool SecureAppSettingsRepository::isMayakRussiaDirectEnabled() const
 {
     return value("Conf/mayakRussiaDirect", true).toBool();
@@ -569,6 +615,8 @@ QString SecureAppSettingsRepository::mayakSessionToken() const
 bool SecureAppSettingsRepository::setMayakSessionToken(const QString &token)
 {
     if (!mayakSessionToken().isEmpty() && mayakSessionToken() != token) emit mayakSessionChanging();
+    // The owner's manual exit list belongs to the signed-in account: another session starts at «Авто».
+    if (mayakSessionToken() != token) setMayakManualExits({});
     const QString key = QStringLiteral("Mayak/sessionToken");
     if (token.isEmpty()) {
         return m_settings->removeAndSync(key);
